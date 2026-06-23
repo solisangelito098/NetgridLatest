@@ -1,0 +1,219 @@
+services:
+  - type: web
+    name: netgrid
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: NODE_ENV
+        value: production
+      - key: CRAWL_DELAY_MS
+        value: "2000"
+      - key: MAX_CONCURRENT_CRAWLS
+        value: "5"
+      - key: CRAWL_WINDOW_START
+        value: "02:00"
+      - key: CRAWL_WINDOW_END
+        value: "06:00"
+      - key: POST_CHECK_INTERVAL_HOURS
+        value: "6"
+      - key: DATABASE_URL
+        sync: false
+      - key: NEXTAUTH_URL
+        sync: false
+      - key: NEXTAUTH_SECRET
+        sync: false
+      - key: NEXT_PUBLIC_APP_URL
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: AHREFS_API_KEY
+        sync: false
+      - key: SEMRUSH_API_KEY
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+
+  # ──────────────────────────────────────────────────────────────────────
+  # SEO SCAN — once-per-month per blog.
+  #
+  # The route enforces a strict once-per-month boundary in SQL: blogs
+  # scanned this calendar month are EXCLUDED from the candidate query
+  # automatically. So even though the rush cron fires hourly for 7
+  # days (168 runs), each individual blog gets exactly one scan per
+  # month. Once everyone is covered, subsequent runs return
+  # "all active blogs already scanned this month" with zero work.
+  #
+  # Capacity:
+  #   168 runs × 20 blogs = 3,360 scan slots per month
+  #   → comfortably covers a 3,000-blog network
+  #
+  # Reporting flow:
+  #   Day 25-31 — rush scans every blog once, writes lastSeoScanAt
+  #   Day 1, 09:00 PH — monthly-reports cron reads fresh per-blog
+  #                     scores into the PDF
+  #
+  # Manual catch-up: hit /api/cron/seo-scan?force=1&limit=20 to ignore
+  # the once-per-month filter (useful after onboarding new blogs
+  # mid-month).
+  # ──────────────────────────────────────────────────────────────────────
+
+  - type: cron
+    name: netgrid-cron-seo-scan-rush
+    runtime: docker
+    schedule: "0 * 25-31 * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/seo-scan?limit=20&concurrency=5
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "360"
+
+  # Post verification — every 6h aligned to PH morning: 02 / 08 / 14 / 20 PH.
+  # 02 PH = 18 UTC (prev day), 08 PH = 00 UTC, 14 PH = 06 UTC, 20 PH = 12 UTC.
+  - type: cron
+    name: netgrid-cron-post-verification
+    runtime: docker
+    schedule: "0 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+
+  # Monthly reports — 09:00 PH on the 1st of each month.
+  # 09:00 PH = 01:00 UTC same day. PDFs land in client inboxes around
+  # 9am-10am PH local working hours.
+  - type: cron
+    name: netgrid-cron-monthly-reports
+    runtime: docker
+    schedule: "0 1 1 * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/monthly-reports
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Auto-publish — 4-way SHARDED. Each blog's UUID is hashed and assigned
+  # to exactly one shard (shardForBlog in content-generation-actions.ts).
+  # Running four parallel cron services means four times the throughput:
+  #
+  #   1 shard,  hourly  → ~16-20 blogs/hour →   ~400 posts/day max
+  #   4 shards, hourly  → ~64-80 blogs/hour →  ~1,600 posts/day max
+  #
+  # At 3,500 sites posting weekly (= 500/day average, up to 1,500/day if
+  # weekdays cluster), four shards gives enough headroom. Each shard is
+  # an independent cron service — drop or add shards later by editing
+  # this file. The hash partition guarantees no two shards ever process
+  # the same blog (no double-posts).
+  #
+  # Schedule is hourly UTC (timezone-invariant). Each blog still has its
+  # own preferredHour internal slot — the cron just gates when shards
+  # can do work.
+  # ──────────────────────────────────────────────────────────────────────
+
+  - type: cron
+    name: netgrid-cron-auto-publish-0
+    runtime: docker
+    schedule: "0 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/auto-publish?shard=0&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-auto-publish-1
+    runtime: docker
+    schedule: "0 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/auto-publish?shard=1&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-auto-publish-2
+    runtime: docker
+    schedule: "0 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/auto-publish?shard=2&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-auto-publish-3
+    runtime: docker
+    schedule: "0 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/auto-publish?shard=3&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  # Schedule: 06:00 PH every Tuesday.
+  # 06:00 PH Tue = 22:00 UTC Mon.
+  # ISO weekday in cron: 1=Mon → "0 22 * * 1".
+  - type: cron
+    name: netgrid-cron-refresh-news
+    runtime: docker
+    schedule: "0 22 * * 1"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/refresh-news
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false

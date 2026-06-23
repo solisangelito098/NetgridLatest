@@ -1,0 +1,2825 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { composeForPost } from "@/lib/content/composer/compose";
+import { runScrubber, runScrubberLite, type ScrubberReport } from "@/lib/content/scrubber";
+import type { StyleProfile } from "@/lib/content/types";
+import { SUB_NICHES } from "@/lib/content/libraries/sub-niches";
+import {
+  truncateToPx,
+  TITLE_FONT_PX,
+  DESC_FONT_PX,
+  TITLE_TARGET_PX,
+  DESC_TARGET_PX,
+} from "@/lib/seo/text-width";
+import {
+  generateBodyImage,
+  generateHeroImage,
+} from "@/lib/services/image-generator";
+
+// Match the model used elsewhere in the project.
+const CLAUDE_MODEL = "claude-sonnet-4-5";
+
+// Sonnet 4.5 pricing — per-token (USD), not per-1K. Verify current rates at
+// https://www.anthropic.com/pricing before relying on cost reporting.
+// As of writing: $3 / 1M input tokens, $15 / 1M output tokens.
+const PRICING = {
+  inputPerToken: 0.000003,
+  outputPerToken: 0.000015,
+};
+
+// Network-wide word-count policy. Single source of truth lives in
+// src/lib/content/config.ts. Imported here so both the legacy
+// (non-profile) generation path and the profile-driven path use the
+// same range. Change those constants once to shift the policy
+// everywhere.
+import {
+  GLOBAL_WORD_BAND_MAX,
+  GLOBAL_WORD_BAND_MIN,
+} from "@/lib/content/config";
+import {
+  takeNewsContextForVertical,
+  formatNewsContextForPrompt,
+  getRecentNewsForVerticalInternal,
+} from "@/lib/actions/news-actions";
+
+const MIN_WORDS = GLOBAL_WORD_BAND_MIN;
+const MAX_WORDS = GLOBAL_WORD_BAND_MAX;
+
+// One retry per topic on shape drift ({title} only, {title, deck}, etc.).
+// 1 = 2 total attempts. Second attempt is a stripped-down last chance.
+const MAX_SHAPE_RETRIES = 1;
+
+/** Appended to the user prompt on the retry attempt. */
+const SHAPE_RETRY_REMINDER = `
+
+Your previous response was missing the article body. Please write the full piece this time and return it as the "content" field of the JSON. Sample shape:
+
+{
+  "title": "...",
+  "content": "<p>Opening paragraph...</p><h2>Section heading</h2><p>...</p><h2>Next section</h2><p>...</p>",
+  "excerpt": "...",
+  "metaTitle": "...",
+  "metaDescription": "...",
+  "keywords": ["...", "...", "..."]
+}
+
+The "content" field should hold the article body itself — opening, sections with <h2> headings, paragraphs, lists where useful, and a closing. Target roughly ${MIN_WORDS}+ words. Write naturally; this is consumer-information content.`;
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ─── Niche contexts ─────────────────────────────────────────────────────────
+
+interface NicheContext {
+  label: string;
+  industry: string;
+  defaultAudience: string;
+  defaultBrandVoice: string;
+  contentStyle: string;
+  keyTopics: string[];
+}
+
+const NICHE_CONTEXTS: Record<string, NicheContext> = {
+  reputation_sites: {
+    label: "Good Reputation Sites & Reviews",
+    industry: "Reputation Management",
+    defaultAudience: "Business owners, consumers, marketers researching reviews",
+    defaultBrandVoice: "professional and balanced, ethical consultant",
+    contentStyle: "Balanced perspective addressing both business and consumer viewpoints, platform-specific details, ethical practices only",
+    keyTopics: ["Trustpilot", "Yelp", "Google Reviews", "BBB", "G2", "review response", "fake reviews", "reputation management"],
+  },
+  peptides: {
+    label: "Peptides & Performance Enhancement",
+    industry: "Health & Performance",
+    defaultAudience: "Bodybuilders, biohackers, anti-aging seekers, researchers, medical professionals",
+    defaultBrandVoice: "scientific yet accessible, evidence-based",
+    contentStyle: "Scientific credibility with E-A-T compliance, reference actual studies, acknowledge limitations, never recommend suppliers",
+    keyTopics: ["BPC-157", "TB-500", "peptide protocols", "growth hormone", "tissue repair", "clinical research"],
+  },
+  gambling: {
+    label: "Gambling, Sports Betting & Online Casino",
+    industry: "Sports Betting, Wagering Markets & Online Casino",
+    defaultAudience: "Adult gambling readers across the curve: recreational sports bettors and casino players who want to understand the math before they wager, line-shopping and bonus-hunting enthusiasts, sharper bettors interested in closing-line value and Kelly sizing, casino players researching RTP and wagering requirements, betting/casino journalists, and responsible-gambling advocates focused on consumer protection",
+    defaultBrandVoice: "analytical statistical voice with consumer-protection awareness — explains expected value, line movement, vig math, house edge, and RTP openly. Not a tipster, pick-seller, or operator promoter; a consumer-information explainer who treats the reader as informed and capable",
+    contentStyle: "Statistical and market analysis over hot takes, pick promotion, or operator hype. SPORTS BETTING: lead with concrete math — -110 means a 4.55% vig, +EV requires beating closing line value, the long-term win rate needed to overcome juice. Use real odds in American (+150 / -110), decimal (2.50 / 1.91), and fractional (3/2 / 10/11); show the conversion at least once. Reference real sportsbooks by name and jurisdiction: DraftKings / FanDuel / BetMGM / Caesars / ESPN BET (US), Pinnacle (sharp-friendly), bet365 / William Hill (UK/EU), PointsBet / theScore Bet (Canada), Mise-o-jeu+ (Loto-Québec, Québec). Cover sport-specific market structure: NFL spreads/totals (key numbers 3, 7, 10, 14), NBA totals and player props, MLB run lines, NHL puck lines, soccer 1X2 / Asian handicap / BTTS / corners. ONLINE CASINO: use real RTP percentages — 95–97% typical slots, 99.5% blackjack basic strategy, 98.65% European roulette, 97.3% American roulette. Reference named game providers (Pragmatic Play, NetEnt, Evolution, Microgaming, Play'n GO) and a few specific top-grossing titles. Be precise about welcome-bonus mechanics: wagering requirements (e.g. 35x bonus + deposit), max-bet caps, game contribution percentages (slots usually 100%, blackjack often 10% or excluded). Acknowledge openly that the house edge means most bettors AND most casino players lose long-term — the math says so — and frame every piece as consumer information. Include responsible-gambling language naturally: deposit limits, self-exclusion (Loto-Québec's program, GamCare, NCPG, Jeu Responsable), session timers, never chase losses. Distinguish regulated jurisdictions (state-by-state US, AGCO Ontario, UKGC, MGA, NJ DGE) from offshore Curaçao operators — never recommend offshore as a way to bypass regulation. Numbers and historical context are great; profit-promise language is not.",
+    keyTopics: ["closing line value", "expected value", "EV calculation", "vig", "juice", "no-vig odds", "Kelly criterion", "bankroll management", "unit sizing", "line movement", "steam moves", "sharps vs squares", "DraftKings", "FanDuel", "BetMGM", "Pinnacle", "bet365", "Mise-o-jeu+", "NFL spreads", "NBA totals", "MLB run lines", "soccer 1X2", "Asian handicap", "moneyline odds", "player props", "parlays", "live betting", "online slots", "blackjack", "roulette", "baccarat", "live dealer", "video poker", "casino welcome bonus", "wagering requirements", "RTP", "house edge", "Pragmatic Play", "NetEnt", "Evolution Gaming", "responsible gambling", "self-exclusion", "AGCO Ontario", "UKGC", "MGA", "Loto-Québec", "+EV spots"],
+  },
+  apps_marketing: {
+    label: "Apps Marketing & Reviews",
+    industry: "Mobile Apps & Software",
+    defaultAudience: "App users, productivity seekers, buyers researching software",
+    defaultBrandVoice: "honest reviewer, practical and helpful",
+    contentStyle: "Test apps when possible, mention limitations honestly, real pricing, platform differences (iOS vs Android)",
+    keyTopics: ["app reviews", "productivity apps", "app comparison", "mobile software", "app features", "user experience"],
+  },
+  exclusive_models: {
+    label: "Creator Platforms & OnlyFans Business",
+    industry: "Creator Economy",
+    defaultAudience: "Aspiring creators, current creators, business researchers",
+    defaultBrandVoice: "professional business advisor, entrepreneurial consultant",
+    contentStyle: "Business-first framing not explicit content, frame as entrepreneurship, real numbers on fees and earnings, respect creator autonomy",
+    keyTopics: ["OnlyFans", "Fansly", "creator monetization", "content marketing", "subscriber retention", "creator business", "platform fees"],
+  },
+  ecom_nails: {
+    label: "Nails & Beauty E-commerce",
+    industry: "Beauty & Cosmetics",
+    defaultAudience: "Beginners to experienced home manicurists, beauty enthusiasts",
+    defaultBrandVoice: "practical and experienced, helpful beauty enthusiast",
+    contentStyle: "Correct product terminology, reference actual brands with real prices, include timing, describe looks specifically",
+    keyTopics: ["gel polish", "nail art", "chrome powder", "builder gel", "manicure techniques", "nail products", "nail trends"],
+  },
+  soccer_jersey: {
+    label: "Soccer Jerseys & Fan Merchandise",
+    industry: "Sports Merchandise",
+    defaultAudience: "Passionate fans, collectors, parents, gift buyers",
+    defaultBrandVoice: "knowledgeable fan perspective, experienced collector",
+    contentStyle: "Distinguish authentic vs replica vs counterfeit, use proper terminology (kit, strip), sizing by manufacturer, authentication methods",
+    keyTopics: ["authentic jerseys", "replica jerseys", "soccer kits", "jersey sizing", "fan merchandise", "jersey collecting", "team jerseys"],
+  },
+  payment_processing: {
+    label: "Payment Processing & Fintech",
+    industry: "Financial Technology",
+    defaultAudience: "Business owners, financial decision-makers, developers, e-commerce operators",
+    defaultBrandVoice: "business consultant, fintech expert, technical advisor",
+    contentStyle: "Use correct terminology (interchange, acquirer, PSP), real fee structures, include hidden costs, compliance requirements",
+    keyTopics: ["Stripe", "Square", "payment gateway", "transaction fees", "PCI compliance", "merchant account", "payment integration"],
+  },
+  web_dev: {
+    label: "Web Development",
+    industry: "Software Development",
+    defaultAudience: "Beginners to experienced developers evaluating tools and approaches",
+    defaultBrandVoice: "experienced developer, pragmatic engineer",
+    contentStyle: "Use current web standards, reference actual versions (React 18, Node 20), address trade-offs honestly, explain why not just how",
+    keyTopics: ["React", "Next.js", "JavaScript", "web performance", "frameworks", "frontend development", "backend development"],
+  },
+  app_dev: {
+    label: "App Development",
+    industry: "Mobile Development",
+    defaultAudience: "Entrepreneurs, business stakeholders, developers evaluating platforms",
+    defaultBrandVoice: "realistic consultant, mobile development expert",
+    contentStyle: "Balance business and technical perspectives, honest cost ranges and timelines, include ongoing costs, post-launch reality",
+    keyTopics: ["React Native", "Flutter", "iOS development", "Android development", "app costs", "mobile development", "cross-platform"],
+  },
+  construction: {
+    label: "Construction & B2B Services",
+    industry: "Construction",
+    defaultAudience: "Contractors, subcontractors, construction business owners, project managers",
+    defaultBrandVoice: "industry veteran, construction business consultant",
+    contentStyle: "Use correct construction terminology (GC, sub, bid process), real cost ranges, regulatory requirements, regional differences",
+    keyTopics: ["commercial construction", "bidding strategy", "project management", "subcontractors", "construction business", "permits"],
+  },
+  loans: {
+    label: "Loans & Lending",
+    industry: "Financial Services",
+    defaultAudience: "Borrowers researching options, credit rebuilders, financial education seekers",
+    defaultBrandVoice: "responsible financial advisor, consumer advocate",
+    contentStyle: "Use correct financial terminology (APR, LTV, DTI), show total cost not just monthly payment, address predatory lending red flags",
+    keyTopics: ["personal loans", "mortgage", "APR", "interest rates", "credit score", "loan qualification", "debt consolidation"],
+  },
+  tax_lawyer: {
+    label: "Tax Law & IRS Representation",
+    industry: "Legal Services",
+    defaultAudience: "Individuals and business owners facing tax issues, CPAs researching legal options, small business owners",
+    defaultBrandVoice: "authoritative legal advisor, plain-English translator of tax code",
+    contentStyle: "Cite specific IRC sections and real penalty schedules, distinguish federal vs state, use concrete dollar examples and timelines, always note this is general info not legal advice",
+    keyTopics: ["IRS audit", "tax debt settlement", "offer in compromise", "innocent spouse relief", "FBAR penalties", "back taxes", "wage garnishment", "tax court", "installment agreement"],
+  },
+  charity: {
+    label: "Charity & Nonprofit Operations",
+    industry: "Nonprofit Sector",
+    defaultAudience: "Nonprofit founders, board members, donors, fundraisers, grant writers",
+    defaultBrandVoice: "mission-driven advisor, experienced nonprofit operator",
+    contentStyle: "Reference real 501(c)(3) requirements and actual grant sources, cite donor psychology research, include realistic budgets and overhead ratios, cover legal compliance honestly",
+    keyTopics: ["501(c)(3) status", "donor retention", "grant writing", "fundraising campaigns", "nonprofit governance", "Form 990", "Giving Tuesday", "donor stewardship", "capital campaigns"],
+  },
+  pest_extermination: {
+    label: "Pest Control & Extermination",
+    industry: "Pest Management Services",
+    defaultAudience: "Homeowners with pest issues, property managers, small business owners, DIY-curious researchers",
+    defaultBrandVoice: "experienced pest control professional, practical exterminator",
+    contentStyle: "Use correct pest names (German cockroach vs American), seasonal pest patterns, real product names (Termidor, Advion), distinguish DIY vs professional treatments, address safety for pets and children",
+    keyTopics: ["termites", "bed bugs", "cockroach treatment", "rodent control", "ant infestations", "wasp removal", "integrated pest management", "preventive maintenance", "pest inspections"],
+  },
+  roofing: {
+    label: "Roofing & Roof Repair",
+    industry: "Roofing Contracting",
+    defaultAudience: "Homeowners needing repairs or replacement, property managers, contractors comparing materials",
+    defaultBrandVoice: "experienced roofing contractor, practical industry veteran",
+    contentStyle: "Distinguish material types (asphalt shingle, metal, tile, TPO), give real cost ranges per square, address regional climate considerations and warranty terms, walk through insurance claim processes honestly",
+    keyTopics: ["asphalt shingles", "metal roofing", "roof replacement cost", "storm damage claims", "roof inspections", "flashing", "underlayment", "roof leaks", "TPO commercial roofing"],
+  },
+  gym_subscription: {
+    label: "Gym Memberships & Fitness Subscriptions",
+    industry: "Fitness & Wellness",
+    defaultAudience: "Consumers comparing gyms, fitness beginners, gym owners researching the market, budget-conscious health seekers",
+    defaultBrandVoice: "honest fitness consultant, practical gym-goer",
+    contentStyle: "Compare actual chains (Planet Fitness, LA Fitness, Equinox) with real prices, contract terms, and cancellation policies, distinguish big-box vs boutique vs class-based, address hidden fees honestly",
+    keyTopics: ["Planet Fitness", "Equinox", "ClassPass", "CrossFit memberships", "gym contracts", "cancellation policies", "boutique fitness", "personal training costs", "gym comparison"],
+  },
+  gym_franchise: {
+    label: "Gym Franchise Openings & Launches",
+    industry: "Fitness Franchise",
+    defaultAudience: "Local readers tracking new fitness options, prospective first-time members, fitness journalists, franchise operators",
+    defaultBrandVoice: "local fitness journalist covering opening-day stories",
+    contentStyle: "Focused on NEW gym launches and franchise openings — not ongoing membership comparisons (that's a separate niche). Cover ribbon-cutting dates, founder backgrounds, equipment partners, opening-day promotions, the franchise's local footprint. Name specific chains by their real local names — in Quebec: Énergie Cardio, Éconofitness, Nautilus Plus, Buzzfit, World Gym. Distinguish franchise vs corporate vs independent. Mention permit timing or municipal context when known.",
+    keyTopics: ["new gym opening", "franchise launch", "ribbon cutting", "grand opening promotions", "franchise owner", "Énergie Cardio", "Éconofitness", "Nautilus Plus", "Buzzfit", "World Gym", "first-month free", "equipment partner", "build-out timeline"],
+  },
+    real_estate: {
+    label: "Real Estate & Property",
+    industry: "Real Estate",
+    defaultAudience: "Home buyers and sellers, first-time mortgage applicants, small-to-mid investors evaluating rental or flip opportunities, real estate agents, brokerage staff, and local-market journalists",
+    defaultBrandVoice: "experienced market analyst translating data into plain language — consumer-information voice, not sales pitch",
+    contentStyle: "Concrete numbers over generic advice. Use real median sale prices, $/sq ft, days-on-market, price-to-rent ratios, cap rates, and cash-on-cash returns from named sources (NAR, Zillow Research, FRED, S&P CoreLogic Case-Shiller, CMHC for Canada, local MLS boards). Distinguish residential vs commercial vs mixed-use. Cover mortgage mechanics with the right vocabulary (DTI, LTV, PMI thresholds, 30-year vs 15-year amortization, conventional vs FHA vs CMHC-insured). Address regional variation honestly: Toronto, Montréal, Vancouver, and rural Quebec differ sharply. For investor content, name the concept (1% rule, 50% rule, cap rate ranges) and show the math. Surface transaction costs (5-6% agent split, 2-5% closing, transfer/welcome tax). Frame everything as general information; never give specific legal or tax advice.",
+    keyTopics: ["home buying", "first-time buyer", "mortgage rates", "down payment", "closing costs", "MLS listing", "real estate agent commission", "cap rate", "cash-on-cash return", "rental yield", "1031 exchange", "median sale price", "days on market", "market report", "DTI ratio", "LTV", "PMI", "amortization", "commercial real estate", "investment property", "house flipping", "REIT", "Toronto market", "Montréal market", "welcome tax"],
+  },
+};
+
+const DEFAULT_NICHE: NicheContext = {
+  label: "General",
+  industry: "General",
+  defaultAudience: "general audience",
+  defaultBrandVoice: "professional and informative",
+  contentStyle: "clear and engaging",
+  keyTopics: [],
+};
+
+/**
+ * Niche aliases — keys that resolve to another canonical niche. online_casino
+ * is folded into the single "gambling" niche, which now covers BOTH sportsbook
+ * and casino content. Any blog row still stored as "online_casino" keeps
+ * working and is treated as gambling everywhere (context, requirements,
+ * language).
+ */
+const NICHE_ALIASES: Record<string, string> = {
+  online_casino: "gambling",
+};
+
+export function normalizeNicheKey(niche: string | null | undefined): string | null {
+  if (!niche) return null;
+  const key = niche.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!key) return null;
+  return NICHE_ALIASES[key] ?? key;
+}
+
+/**
+ * Turn a raw niche string into a human-readable label.
+ *
+ *   "Dog Grooming"  → "Dog Grooming"
+ *   "dog_grooming"  → "Dog Grooming"
+ *   "DOG-GROOMING"  → "Dog Grooming"
+ *
+ * Used when synthesizing a NicheContext on the fly for unregistered niches
+ * so the ideation + article prompts still get a real topical anchor instead
+ * of falling back to a generic "General" placeholder.
+ */
+function humanizeNiche(raw: string): string {
+  return raw
+    .trim()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .map((w) => (w.length === 0 ? w : w[0].toUpperCase() + w.slice(1).toLowerCase()))
+    .join(" ");
+}
+
+export function getNicheContext(niche: string | null | undefined): NicheContext {
+  const key = normalizeNicheKey(niche);
+  if (!key) return DEFAULT_NICHE;
+
+  const registered = NICHE_CONTEXTS[key];
+  if (registered) return registered;
+
+  // Unregistered niche — synthesize a context from the typed string so
+  // Claude is still grounded in the admin's intent (e.g. "Dog Grooming"
+  // produces "blog topics for a Dog Grooming niche site"). The 17 curated
+  // niches above still give sharper output because of their hand-tuned
+  // keyTopics, audience, voice, and style cues — but a synthesized context
+  // is far better than silently writing about "general" topics.
+  const label = humanizeNiche(niche!);
+  return {
+    label,
+    industry: label,
+    defaultAudience: `readers interested in ${label.toLowerCase()}`,
+    defaultBrandVoice: "knowledgeable and helpful, evidence-based",
+    contentStyle:
+      "clear and specific, use real names and numbers when possible, acknowledge limitations honestly, avoid generic filler",
+    keyTopics: [],
+  };
+}
+
+export function getAvailableNiches(): Array<{ key: string; label: string }> {
+  return Object.entries(NICHE_CONTEXTS).map(([key, ctx]) => ({ key, label: ctx.label }));
+}
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+export type Tone = "professional" | "casual" | "friendly" | "authoritative" | "technical" | "warm";
+
+export interface GenerateOptions {
+  topic: string;
+  keywords: string[];
+  wordCount: number;
+  tone: Tone;
+  niche?: string | null;
+  brandVoice?: string;
+  targetAudience?: string;
+  seoOptimized?: boolean;
+  /**
+   * When present, the composer uses this style profile to build the prompt
+   * via the skeleton pipeline (overrides the niche-based default prompt).
+   * The scrubber also runs profile-aware checks on the generated content.
+   */
+  styleProfile?: StyleProfile;
+  /**
+   * Vertical key (from src/lib/content/verticals/registry.ts). When set
+   * AND the niche is not peptides, the generator pulls recent news
+   * items for this vertical and instructs Claude to weave 1-3 of them
+   * in as external `<a href>` links — adds topical credibility AND
+   * outbound link signal for SEO. Peptide blogs intentionally skip
+   * external news links for compliance.
+   */
+  verticalKey?: string | null;
+  /**
+   * Output language for the article. Comes from the vertical config's
+   * `language` field.
+   *   "en"    → English (default)
+   *   "fr"    → French (Québec-French phrasing for the QC verticals)
+   *   "en_fr" → bilingual vertical; defaults to English here (per-track
+   *             FR handling lives in the charity vertical's contentTracks)
+   * When undefined or "en", no language directive is added and Claude
+   * writes in English as before.
+   */
+  language?: "en" | "fr" | "en_fr";
+  /**
+   * Per-blog stylistic seed. When provided, the legacy (non-profile) path
+   * uses it to deterministically pick:
+   *   - 2 writing-habit quirks from QUIRK_POOL
+   *   - a per-blog word band drawn from inside [GLOBAL_WORD_BAND_MIN,
+   *     GLOBAL_WORD_BAND_MAX]
+   *   - a body-image wrapper class name
+   * Same seed → same picks always. The cron passes `blog.id` so each blog
+   * keeps a stable, distinct voice. Profile blogs (peptides) ignore this
+   * field — their composer already does per-blog randomization.
+   */
+  blogSeed?: string;
+  /**
+   * Pre-fetched internal sibling post references for inline link injection.
+   * Each entry is a previously-published post on the SAME blog. Claude is
+   * instructed to weave 2-4 of these as inline <a href> links — adds the
+   * single SEO signal the audit flagged as missing (internal link graph).
+   */
+  internalLinkRefs?: Array<{ title: string; url: string }>;
+  /**
+   * Distilled summaries of the client's active Knowledge Base documents for
+   * this blog. When present, they're appended to the system prompt so the
+   * article draws on the client's own facts/terminology. Placed in the system
+   * prefix (stable per blog) rather than the user message so it stays
+   * cache-friendly if generation is ever batched per blog.
+   */
+  knowledgeSummaries?: string[];
+  /**
+   * Per-client call-to-action button appended to the bottom of the article
+   * body (link to the client's main site / contact / registration page).
+   * Injected deterministically — not LLM-generated.
+   */
+  cta?: { label: string; url: string; placement?: string };
+}
+
+export interface GeneratedContent {
+  title: string;
+  content: string;
+  excerpt: string;
+  metaTitle: string;
+  metaDescription: string;
+  keywords: string[];
+  wordCount: number;
+}
+
+export interface AnalysisScores {
+  seoScore: number;
+  readabilityScore: number;
+  brandVoiceScore: number;
+}
+
+export interface GenerationResult extends GeneratedContent, AnalysisScores {
+  tokensUsed: number;
+  costUsd: number;
+  heroImageUrl?: string;
+  /**
+   * Second deliberately differently-framed image for the body of the
+   * post. Already embedded into `content` HTML at the midpoint by the
+   * generator; surfaced here too so the caller can persist it on its
+   * own column without HTML-parsing.
+   */
+  bodyImageUrl?: string;
+  /** Scrubber audit trail, populated when scrubber runs. */
+  scrubberReport?: ScrubberReport;
+  /** True if scrubber flagged this post for admin review. */
+  flaggedForReview?: boolean;
+}
+
+// ─── Claude wrapper ─────────────────────────────────────────────────────────
+
+interface ClaudeCallResult {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/**
+ * Bracket-aware JSON extraction. Walks the text from the first `{`, tracks
+ * brace depth while ignoring braces inside string literals, and returns
+ * the substring of the first complete top-level object.
+ *
+ * Handles every shape Claude has produced in the wild:
+ *
+ *   {...}                            ← clean
+ *   ```json\n{...}\n```              ← markdown-fenced
+ *   ```\n{...}\n```                  ← bare-fenced
+ *   "Here is the JSON: {...} done."  ← prose-wrapped
+ *   {...}\n```                       ← trailing fence
+ *   \n  {...}\n{...}                 ← multiple objects (returns first)
+ *
+ * Unlike the previous naive "first { to last }" version, this never
+ * mistakes a `}` inside a string value for the closing brace.
+ */
+function extractJsonObject(text: string): string {
+  const startIdx = text.indexOf("{");
+  if (startIdx === -1) return text.trim();
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return text.substring(startIdx, i + 1);
+      }
+    }
+  }
+
+  // Hit end without closing — response was truncated. Return what we have
+  // so the caller can attempt repair / decide whether to retry.
+  return text.substring(startIdx);
+}
+
+/**
+ * Repair common LLM JSON issues that JSON.parse rejects but we can
+ * confidently fix:
+ *
+ *   1. Trailing commas inside arrays / objects: `[1,2,3,]` → `[1,2,3]`
+ *   2. Unescaped control chars inside strings: literal `\n`, `\r`, `\t`
+ *      become escaped `\\n`, `\\r`, `\\t` (Claude sometimes embeds raw
+ *      newlines in HTML content fields)
+ *   3. Smart quotes around keys: `"key"` → `"key"`
+ *
+ * Things this does NOT fix (would require a real parser):
+ *   - Unescaped double quotes inside string values
+ *   - Comments
+ *   - Single-quoted strings
+ *
+ * Caller falls back to retrying the Claude call if these heuristics
+ * aren't enough.
+ */
+function repairLlmJson(text: string): string {
+  // Smart quotes anywhere (Claude rarely produces these but it has)
+  let result = text
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'");
+
+  // Walk the text and escape literal control chars only inside string
+  // literals (where they're invalid JSON). Outside strings they're just
+  // whitespace and JSON.parse accepts them.
+  let fixed = "";
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < result.length; i++) {
+    const ch = result[i];
+
+    if (escape) {
+      fixed += ch;
+      escape = false;
+      continue;
+    }
+
+    if (inString && ch === "\\") {
+      fixed += ch;
+      escape = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      fixed += ch;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\n") {
+        fixed += "\\n";
+        continue;
+      }
+      if (ch === "\r") {
+        fixed += "\\r";
+        continue;
+      }
+      if (ch === "\t") {
+        fixed += "\\t";
+        continue;
+      }
+    }
+
+    fixed += ch;
+  }
+  result = fixed;
+
+  // Strip trailing commas: ", ]" → " ]", ", }" → " }". Regex is safe here
+  // because we only target the comma followed by closing bracket; it
+  // doesn't matter whether we're inside a string because LLMs essentially
+  // never embed literal `, ]` patterns inside string values.
+  result = result.replace(/,(\s*[\]}])/g, "$1");
+
+  return result;
+}
+
+/**
+ * Repair unescaped double quotes that appear INSIDE JSON string values.
+ *
+ * Classic Claude failure mode: emits HTML inside a string field with
+ * unescaped attribute quotes, e.g.
+ *
+ *   { "content": "<a href="https://example.com">link</a>" }
+ *
+ * The inner `"` characters close the string prematurely; downstream
+ * parsing fails with "Expected ',' or '}' after property value" deep in
+ * the response.
+ *
+ * Strategy: walk the text. At every `"`, decide whether it's a real
+ * string boundary or an escaped-but-Claude-forgot-to-escape quote by
+ * looking at the next non-whitespace character:
+ *
+ *   `: , } ] EOF`  → real boundary (key terminator / value separator / structural)
+ *   anything else  → unescaped quote inside a value; escape it
+ *
+ * Tolerates correctly-escaped backslash-quote pairs and ignores quotes
+ * outside string context.
+ */
+function escapeStrayQuotesInsideStrings(text: string): string {
+  let result = "";
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escape) {
+      result += ch;
+      escape = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      result += ch;
+      escape = true;
+      continue;
+    }
+
+    if (ch !== '"') {
+      result += ch;
+      continue;
+    }
+
+    // We hit a `"`. Decide: open, close, or stray-inside-value?
+    if (!inString) {
+      // Outside any string — this opens a new one.
+      inString = true;
+      result += ch;
+      continue;
+    }
+
+    // We're inside a string. Look ahead at the next non-whitespace char.
+    let j = i + 1;
+    while (j < text.length && /\s/.test(text[j])) j++;
+    const next = j < text.length ? text[j] : undefined;
+
+    const isBoundary =
+      next === undefined ||  // end of input
+      next === ":" ||
+      next === "," ||
+      next === "}" ||
+      next === "]";
+
+    if (isBoundary) {
+      // Valid string close.
+      inString = false;
+      result += ch;
+    } else {
+      // Stray unescaped quote inside the value — escape it.
+      result += '\\"';
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Repair JSON that was TRUNCATED mid-output (Claude hit max_tokens before
+ * closing the last string and the wrapping braces). Strategy:
+ *
+ *   1. Walk the text tracking string-context, escape-context, and the
+ *      bracket stack ({ vs [).
+ *   2. Find the last position where a complete key-value pair ended
+ *      (i.e. a `,` at object depth, outside any string). This is the
+ *      safe truncation point that keeps a valid JSON object.
+ *   3. If found, truncate the text there and close all open brackets.
+ *      The post loses the in-progress field but everything else parses.
+ *   4. If no clean boundary found (very short response), close the
+ *      open string + brackets as a last resort.
+ *
+ * The post will be shorter than the originally-requested word count, but
+ * still publishable. The scrubber's word-count check (Layer 1F) catches
+ * it and can request regeneration if needed.
+ */
+function repairTruncatedJson(text: string): string {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let lastSafeBoundary = -1; // position right BEFORE a `,` at object depth
+  const stack: string[] = [];
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      stack.push("{");
+      depth++;
+    } else if (ch === "[") {
+      stack.push("[");
+    } else if (ch === "}") {
+      stack.pop();
+      depth--;
+    } else if (ch === "]") {
+      stack.pop();
+    } else if (
+      ch === "," &&
+      stack.length > 0 &&
+      stack[stack.length - 1] === "{"
+    ) {
+      lastSafeBoundary = i;
+    }
+  }
+
+  // If parse-state ended cleanly, the input is fine.
+  if (!inString && depth === 0 && stack.length === 0) {
+    return text;
+  }
+
+  // Prefer truncating at the last safe object-level comma boundary.
+  let result: string;
+  if (lastSafeBoundary > 0) {
+    result = text.substring(0, lastSafeBoundary);
+  } else {
+    result = text;
+    // Close any in-progress string.
+    if (inString) result += '"';
+  }
+
+  // Recount open brackets at the truncated position and close them.
+  let d = 0;
+  let inStr = false;
+  let esc = false;
+  const closeStack: string[] = [];
+  for (let i = 0; i < result.length; i++) {
+    const ch = result[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (inStr) {
+      if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") {
+      closeStack.push("{");
+      d++;
+    } else if (ch === "[") closeStack.push("[");
+    else if (ch === "}") {
+      closeStack.pop();
+      d--;
+    } else if (ch === "]") closeStack.pop();
+  }
+  if (inStr) result += '"';
+  while (closeStack.length > 0) {
+    const open = closeStack.pop();
+    result += open === "{" ? "}" : "]";
+  }
+
+  return result;
+}
+
+/**
+ * Tolerant article-shape normalizer. Handles the most common ways Claude
+ * deviates from the requested {title, content, excerpt, ...} envelope:
+ *
+ *   1. Wraps the article in an outer object: {"article": {...}} or
+ *      {"data": {...}} or {"response": {...}}
+ *   2. Renames "content" to "html", "body", "article_html", or "article_body"
+ *   3. Renames "title" to "headline" or "post_title"
+ *   4. Splits the article into parts instead of one content string:
+ *        - {intro, items[]}            → listicle
+ *        - {intro, body, conclusion}   → three-part
+ *        - {sections: [{heading, content}, ...]}
+ *        - {paragraphs: ["...", "..."]}
+ *        - {content: [...]} (array instead of string)
+ *      These get stitched into a single HTML string.
+ *
+ * Returns the (possibly unwrapped + remapped) partial. Other shape mismatches
+ * surface as the "missing required fields" error with the actual key list.
+ */
+function normalizeArticleShape(
+  parsed: Partial<GeneratedContent> & Record<string, unknown>,
+): Partial<GeneratedContent> {
+  // Unwrap a single-key wrapper that looks like the real envelope.
+  const wrapperKeys = ["article", "data", "response", "result", "output"];
+  for (const key of wrapperKeys) {
+    const inner = parsed[key];
+    if (
+      inner &&
+      typeof inner === "object" &&
+      !Array.isArray(inner) &&
+      ("title" in (inner as object) ||
+        "content" in (inner as object) ||
+        "intro" in (inner as object) ||
+        "sections" in (inner as object))
+    ) {
+      parsed = inner as Partial<GeneratedContent> & Record<string, unknown>;
+      break;
+    }
+  }
+
+  // Remap alternate field names.
+  if (!parsed.title) {
+    const titleAlt = parsed.headline ?? parsed.post_title ?? parsed.article_title;
+    if (typeof titleAlt === "string") parsed.title = titleAlt;
+  }
+  if (!parsed.content) {
+    const contentAlt =
+      parsed.html ?? parsed.body ?? parsed.article_html ?? parsed.article_body;
+    if (typeof contentAlt === "string") parsed.content = contentAlt;
+  }
+
+  // Multi-part reconstruction — stitch alternate part-shaped responses
+  // into a single HTML content string. Only runs when `content` is still
+  // missing, so a well-formed response is never touched.
+  if (!parsed.content || typeof parsed.content !== "string") {
+    const stitched = reconstructContentFromParts(parsed);
+    if (stitched) {
+      parsed.content = stitched;
+    }
+  }
+
+  return parsed;
+}
+
+/**
+ * Stitch a Claude response that returned the article as parts into a
+ * single HTML string. Best-effort — returns null when nothing usable is
+ * found so the caller can fall through to the "missing required fields"
+ * error with the original key list.
+ *
+ * Handles (in priority order):
+ *
+ *   {sections: [{heading, content}, ...]}
+ *      → <h2>heading</h2><p>content</p> for each section
+ *   {intro: "...", items: ["...", ...]}
+ *      → <p>intro</p><ul><li>item</li>...</ul>
+ *   {intro: "...", items: [{heading, body}, ...]}
+ *      → <p>intro</p><h2>heading</h2><p>body</p>...
+ *   {intro, body, conclusion}
+ *      → <p>intro</p>...body...<p>conclusion</p>
+ *   {paragraphs: ["...", ...]}
+ *      → <p>p1</p><p>p2</p>...
+ *   {content: ["string", "string"]}   (array instead of string)
+ *      → joined as <p>...</p> blocks
+ */
+function reconstructContentFromParts(
+  parsed: Record<string, unknown>,
+): string | null {
+  const out: string[] = [];
+
+  const intro = parsed["intro"];
+  const items = parsed["items"];
+  const sections = parsed["sections"];
+  const paragraphs = parsed["paragraphs"];
+  const conclusion = parsed["conclusion"];
+  const bodyText = parsed["body"];
+  const contentAny = parsed["content"];
+
+  // sections: [{heading, content|body|text}]
+  if (Array.isArray(sections) && sections.length > 0) {
+    if (typeof intro === "string") out.push(maybeWrapHtml(intro));
+    for (const sec of sections) {
+      if (!sec || typeof sec !== "object") continue;
+      const s = sec as Record<string, unknown>;
+      const heading = pickString(s, ["heading", "title", "header"]);
+      const text = pickString(s, ["content", "body", "text", "paragraph"]);
+      if (heading) out.push(`<h2>${escapeHtml(heading)}</h2>`);
+      if (text) out.push(maybeWrapHtml(text));
+    }
+    if (typeof conclusion === "string") out.push(maybeWrapHtml(conclusion));
+    return out.length > 0 ? out.join("\n") : null;
+  }
+
+  // intro + items (listicle or part-shaped)
+  if (Array.isArray(items) && items.length > 0) {
+    if (typeof intro === "string") out.push(maybeWrapHtml(intro));
+    const allStrings = items.every((it) => typeof it === "string");
+    if (allStrings) {
+      // Plain listicle — items are bullet strings.
+      out.push("<ul>");
+      for (const it of items as string[]) {
+        out.push(`<li>${escapeHtml(it)}</li>`);
+      }
+      out.push("</ul>");
+    } else {
+      // Object items — usually {heading/title, body/content/description}.
+      for (const it of items) {
+        if (!it || typeof it !== "object") continue;
+        const i = it as Record<string, unknown>;
+        const heading = pickString(i, ["heading", "title", "header", "name"]);
+        const text = pickString(i, [
+          "body",
+          "content",
+          "description",
+          "text",
+          "paragraph",
+        ]);
+        if (heading) out.push(`<h2>${escapeHtml(heading)}</h2>`);
+        if (text) out.push(maybeWrapHtml(text));
+      }
+    }
+    if (typeof conclusion === "string") out.push(maybeWrapHtml(conclusion));
+    return out.length > 0 ? out.join("\n") : null;
+  }
+
+  // intro + body + conclusion (three-part essay shape)
+  if (
+    typeof intro === "string" ||
+    typeof bodyText === "string" ||
+    typeof conclusion === "string"
+  ) {
+    if (typeof intro === "string") out.push(maybeWrapHtml(intro));
+    if (typeof bodyText === "string") out.push(maybeWrapHtml(bodyText));
+    if (typeof conclusion === "string") out.push(maybeWrapHtml(conclusion));
+    return out.length > 0 ? out.join("\n") : null;
+  }
+
+  // paragraphs: [...]
+  if (Array.isArray(paragraphs) && paragraphs.length > 0) {
+    for (const p of paragraphs) {
+      if (typeof p === "string") out.push(maybeWrapHtml(p));
+    }
+    return out.length > 0 ? out.join("\n") : null;
+  }
+
+  // content: ["string", "string"] — array instead of string
+  if (Array.isArray(contentAny) && contentAny.length > 0) {
+    for (const c of contentAny) {
+      if (typeof c === "string") out.push(maybeWrapHtml(c));
+    }
+    return out.length > 0 ? out.join("\n") : null;
+  }
+
+  return null;
+}
+
+function pickString(
+  obj: Record<string, unknown>,
+  keys: string[],
+): string | null {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && v.trim().length > 0) return v;
+  }
+  return null;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * If the input already looks like HTML (has angle-bracket tags), pass
+ * it through. Otherwise wrap it as a paragraph.
+ */
+function maybeWrapHtml(text: string): string {
+  const trimmed = text.trim();
+  if (/<\s*(p|h[1-6]|ul|ol|li|strong|em|a|br|div|section)\b/i.test(trimmed)) {
+    return trimmed;
+  }
+  return wrapParagraph(trimmed);
+}
+
+function wrapParagraph(text: string): string {
+  return `<p>${escapeHtml(text)}</p>`;
+}
+
+/**
+ * Try JSON.parse on:
+ *   1. The raw text                  (the happy path)
+ *   2. Light repair                  (smart quotes, trailing commas, control chars)
+ *   3. Stray-quote repair            (escape unescaped " inside string values,
+ *                                     e.g. HTML attribute quotes Claude forgot
+ *                                     to backslash-escape)
+ *   4. Truncation repair             (closes unterminated strings + braces,
+ *                                     applied on top of light repair)
+ *
+ * Returns the parsed value or throws the original error with a helpful
+ * preview of where parsing failed.
+ */
+export function safeParseClaudeJson<T = unknown>(text: string): T {
+  // 1. Happy path
+  try {
+    return JSON.parse(text) as T;
+  } catch (err1) {
+    // 2. Light repair
+    try {
+      return JSON.parse(repairLlmJson(text)) as T;
+    } catch {
+      // 3. Stray-quote repair on top of light repair
+      try {
+        return JSON.parse(repairLlmJson(escapeStrayQuotesInsideStrings(text))) as T;
+      } catch {
+        // 4. Truncation repair as last resort
+        try {
+          const recovered = repairTruncatedJson(text);
+          return JSON.parse(
+            repairLlmJson(escapeStrayQuotesInsideStrings(recovered)),
+          ) as T;
+        } catch {
+          const msg = err1 instanceof Error ? err1.message : "JSON parse failed";
+          const match = /position\s+(\d+)/i.exec(msg);
+          if (match) {
+            const pos = parseInt(match[1], 10);
+            const start = Math.max(0, pos - 80);
+            const end = Math.min(text.length, pos + 80);
+            const around = text.slice(start, end).replace(/\s+/g, " ").trim();
+            throw new Error(
+              `${msg} | context near pos ${pos}: "...${around}..."`,
+            );
+          }
+          throw err1;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Returns true when an Anthropic SDK error is worth retrying. We treat
+ * 429 (rate limit), 500/502/503/504 (server), 529 (overloaded), and
+ * network / timeout / connection-reset errors as transient. 4xx other
+ * than 429 are permanent (bad request, auth, etc.) and bubble up.
+ */
+function isTransientClaudeError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const e = err as Error & { status?: number; type?: string };
+  if (e.status !== undefined) {
+    if (e.status === 429 || e.status === 529) return true;
+    if (e.status >= 500 && e.status < 600) return true;
+  }
+  const msg = err.message.toLowerCase();
+  if (
+    msg.includes("rate limit") ||
+    msg.includes("overloaded") ||
+    msg.includes("timeout") ||
+    msg.includes("etimedout") ||
+    msg.includes("econnreset") ||
+    msg.includes("socket hang up") ||
+    msg.includes("network") ||
+    msg.includes("internal server error")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+const MAX_CLAUDE_RETRIES = 3;
+const CLAUDE_BACKOFF_BASE_MS = 2000; // 2s, 4s, 8s
+
+async function callClaudeOnce(
+  system: string,
+  userMessage: string,
+  options: { maxTokens?: number; temperature?: number; expectJson?: boolean },
+): Promise<ClaudeCallResult> {
+  const { maxTokens = 4000, temperature = 0.7, expectJson = false } = options;
+
+  // Compact JSON envelope. The detailed schema rules (no wrapping, no
+  // renaming "content", no "deck"/"subtitle" substitution, etc.) already
+  // live in buildSystemPrompt / composeForPost. safeParseClaudeJson handles
+  // markdown-fence and stray-quote repair, so we don't need to spell that
+  // out either. Keeping this short reduces token cost AND the recognizable
+  // network-wide response shape (per the footprint audit).
+  const finalSystem = expectJson
+    ? `${system}\n\nOUTPUT: Return ONE valid JSON object only. Escape every \\" inside HTML attribute values. Close every string and the object before hitting the token budget — a shorter complete article beats a truncated long one.`
+    : system;
+
+  const response = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: maxTokens,
+    temperature,
+    system: finalSystem,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  const block = response.content.find((b) => b.type === "text");
+  if (!block || block.type !== "text") {
+    throw new Error("Claude returned no text content");
+  }
+
+  const rawText = block.text;
+  // Always extract the JSON object when caller expects JSON. The previous
+  // implementation only stripped when text didn't start with `{`, missing
+  // cases where Claude wrapped output in markdown fences but the first
+  // non-whitespace char appeared to be `{` (or vice versa).
+  const text = expectJson ? extractJsonObject(rawText) : rawText.trim();
+
+  return {
+    text,
+    inputTokens: response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+  };
+}
+
+/**
+ * Public Claude wrapper with automatic retry on transient errors. Each
+ * generation in this app makes 2-3 Claude calls (article, scene summary,
+ * analysis); when scaling to thousands of blogs/day the network will hit
+ * occasional 429s and 529 (overloaded). Without retry every transient
+ * blip turned into a failed post.
+ *
+ * Retry budget: up to MAX_CLAUDE_RETRIES additional attempts with
+ * exponential backoff (2s, 4s, 8s). Total worst-case wait: 14s + 3 calls.
+ */
+async function callClaude(
+  system: string,
+  userMessage: string,
+  options: { maxTokens?: number; temperature?: number; expectJson?: boolean } = {},
+): Promise<ClaudeCallResult> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= MAX_CLAUDE_RETRIES; attempt++) {
+    try {
+      return await callClaudeOnce(system, userMessage, options);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === MAX_CLAUDE_RETRIES) break;
+      if (!isTransientClaudeError(err)) break;
+      const delayMs = CLAUDE_BACKOFF_BASE_MS * Math.pow(2, attempt);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[claude] Transient error (attempt ${attempt + 1}/${MAX_CLAUDE_RETRIES + 1}), retrying in ${delayMs}ms: ${msg.slice(0, 200)}`,
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+function calcCost(inputTokens: number, outputTokens: number): number {
+  return (
+    inputTokens * PRICING.inputPerToken + outputTokens * PRICING.outputPerToken
+  );
+}
+
+// ─── Formatting helpers ─────────────────────────────────────────────────────
+
+function convertMarkdownToHtml(content: string): string {
+  return content
+    .replace(/^######\s+(.+)$/gm, "<h6>$1</h6>")
+    .replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>")
+    .replace(/^####\s+(.+)$/gm, "<h4>$1</h4>")
+    .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
+    .replace(/^##\s+(.+)$/gm, "<h2>$1</h2>")
+    // A single `#` would be the page H1, but the platform (Shopify/WP theme)
+    // already renders the post *title* as the page's sole <h1>. Emitting
+    // another <h1> in the body creates a duplicate-H1 SEO error, so we map
+    // `#` to <h2> instead. demoteH1ToH2() below is the belt-and-suspenders
+    // catch for any literal <h1> Claude writes directly as HTML.
+    .replace(/^#\s+(.+)$/gm, "<h2>$1</h2>")
+    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(?<!\*)\*([^*]+?)\*(?!\*)/g, "<em>$1</em>");
+}
+
+function sanitizeMetadata(html: string): string {
+  return html
+    .replace(/<p>\s*Created:\s*.+?<\/p>/gi, "")
+    .replace(/<p>\s*Niche:\s*.+?<\/p>/gi, "")
+    .replace(/<p>\s*Keywords?:\s*.+?<\/p>/gi, "")
+    .replace(/<p>\s*<em>Discover\s+.+?<\/em>\s*<\/p>/gi, "")
+    .replace(/<p>\s*<\/p>/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Strip any Claude-emitted image tags (they'd have placeholder or hallucinated
+ * URLs that 404). We attach a real hero image as a featured image at publish
+ * time instead.
+ */
+function stripClaudeImages(html: string): string {
+  return html
+    .replace(/<figure\b[^>]*>[\s\S]*?<\/figure>/gi, "")
+    .replace(/<picture\b[^>]*>[\s\S]*?<\/picture>/gi, "")
+    .replace(/<img\b[^>]*\/?>/gi, "")
+    .replace(/<source\b[^>]*\/?>/gi, "")
+    .replace(/<figcaption\b[^>]*>[\s\S]*?<\/figcaption>/gi, "")
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
+    .replace(/<p>\s*<\/p>/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Soft word-count enforcement: if Claude ignored the upper bound, trim down to
+ * the last word that still fits within MAX_WORDS. We never pad shorts — that's
+ * the prompt's job.
+ */
+function capWordCount(html: string, max: number): string {
+  const words = html.split(/(\s+)/);
+  let count = 0;
+  let i = 0;
+  for (; i < words.length; i++) {
+    if (words[i].trim()) {
+      count++;
+      if (count > max) break;
+    }
+  }
+  if (count <= max) return html;
+  const truncated = words.slice(0, i).join("");
+  const openTags = (truncated.match(/<p>/gi) || []).length;
+  const closeTags = (truncated.match(/<\/p>/gi) || []).length;
+  return openTags > closeTags ? truncated + "</p>" : truncated;
+}
+
+function countWordsInHtml(html: string): number {
+  const text = html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return text ? text.split(" ").filter((w) => w.length > 0).length : 0;
+}
+
+function generateExcerpt(content: string): string {
+  const text = content.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return text.length > 160 ? text.substring(0, 157) + "..." : text;
+}
+
+// SEO meta sizing is PIXEL based (see @/lib/seo/text-width). We normalize TO
+// the strict-safe write targets (TITLE_TARGET_PX / DESC_TARGET_PX) so what we
+// generate clears the audit ceilings (580px / 1000px) with headroom.
+
+/**
+ * Demote every <h1> in the body to <h2>. The platform renders the post
+ * TITLE as the page's single <h1>; any <h1> inside the body produces the
+ * "Too many H1 headings" audit error. Runs on both the legacy and profile
+ * paths so no generation route can leak a body H1.
+ *
+ * Preserves attributes on the opening tag (rare, but harmless) by only
+ * swapping the tag name.
+ */
+export function demoteH1ToH2(html: string): string {
+  return html
+    .replace(/<h1(\s[^>]*)?>/gi, "<h2$1>")
+    .replace(/<\/h1\s*>/gi, "</h2>");
+}
+
+/** True when the HTML contains at least one <h1> tag. */
+export function hasH1(html: string): boolean {
+  return /<h1(\s[^>]*)?>/i.test(html);
+}
+
+/** Normalize heading text for duplicate comparison. */
+function normalizeHeadingText(inner: string): string {
+  return inner
+    .replace(/<[^>]+>/g, "") // strip nested tags
+    .replace(/&[a-z]+;/gi, " ") // entities → space
+    .replace(/[^\p{L}\p{N}\s]/gu, "") // drop punctuation
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Remove duplicate heading TEXT from the body (Seobility "duplicate heading
+ * texts" warning). Keeps the first occurrence of each heading; for any later
+ * heading with the same normalized text — or one that just restates the page
+ * title (the body's content stays; only the redundant heading element is
+ * dropped, so the prose flows on without a repeated label).
+ *
+ * `title` is the post title (the page's sole <h1>), seeded as "already seen"
+ * so a body heading echoing the title is removed too.
+ */
+export function dedupeHeadings(html: string, title: string): string {
+  const seen = new Set<string>();
+  const titleKey = normalizeHeadingText(title);
+  if (titleKey) seen.add(titleKey);
+
+  return html.replace(
+    /<h([2-6])(\s[^>]*)?>([\s\S]*?)<\/h\1\s*>/gi,
+    (match, _level, _attrs, inner) => {
+      const key = normalizeHeadingText(inner);
+      if (!key) return match; // empty heading — leave as-is
+      if (seen.has(key)) return ""; // duplicate → drop the heading element
+      seen.add(key);
+      return match;
+    },
+  );
+}
+
+/**
+ * Normalize the SEO meta TITLE (the <title> / title-tag) to the audit spec:
+ *   - collapse whitespace
+ *   - convert spaced-hyphen / en-dash / em-dash separators to " | "
+ *     (Seobility / Google best practice) and collapse duplicates
+ *   - cap at TITLE_TARGET_PX (strict-safe under the 580px limit) on a word
+ *     boundary — NO brand/site-name suffix is appended (we set the SEO
+ *     title explicitly, overriding the theme template that would add one)
+ * Falls back to the article title when Claude omitted metaTitle.
+ */
+export function normalizeMetaTitle(
+  raw: string | null | undefined,
+  fallback: string,
+): string {
+  let t = (raw || fallback || "").replace(/\s+/g, " ").trim();
+  // Separator normalization: spaced dashes → vertical bar.
+  t = t.replace(/\s*[–—]\s*/g, " | ").replace(/\s+-\s+/g, " | ");
+  // Collapse any doubled separators and strip leading/trailing ones.
+  t = t
+    .replace(/(?:\s*\|\s*){2,}/g, " | ")
+    .replace(/^\s*\|\s*|\s*\|\s*$/g, "")
+    .trim();
+  return truncateToPx(t, TITLE_FONT_PX, TITLE_TARGET_PX);
+}
+
+/**
+ * Normalize the SEO meta DESCRIPTION to the audit spec:
+ *   - collapse whitespace
+ *   - cap at DESC_TARGET_PX (strict-safe under the 1000px limit) on a word
+ *     boundary
+ * We never pad shorts — a shorter accurate description beats filler.
+ * Falls back to a body-derived excerpt when Claude omitted metaDescription.
+ */
+export function normalizeMetaDescription(
+  raw: string | null | undefined,
+  fallback: string,
+): string {
+  const d = (raw || fallback || "").replace(/\s+/g, " ").trim();
+  return truncateToPx(d, DESC_FONT_PX, DESC_TARGET_PX);
+}
+
+// Hero-image URL generation lives in image-generator.ts. The composer here
+// also runs a small Claude call (summarizeArticleAsScene below) that turns
+// the freshly-written article body into a concrete photographic scene
+// description, which then gets passed to the image model as a customPrompt.
+// This is what makes the hero image actually match the post's topic instead
+// of falling back to whatever generic visual theme the style profile has.
+
+/**
+ * Use Claude to convert an article into a single-sentence photographic scene
+ * description suitable for Nano Banana / Imagen. The call is small (~200
+ * output tokens) and adds ~2-4s and ~$0.001 to total generation cost. In
+ * exchange, the image becomes content-aware instead of theme-locked.
+ *
+ * Returns null on any failure so the caller falls back to the static
+ * scene-builder in image-generator.buildImagePrompt().
+ */
+async function summarizeArticleAsScene(
+  title: string,
+  bodyHtml: string,
+  keywords: string[],
+): Promise<string | null> {
+  // Strip HTML and take the first ~2000 chars — enough to identify the
+  // article's actual subject without paying for the whole body's tokens.
+  const plain = bodyHtml
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 2000);
+
+  const system = `You write image-generation prompts for editorial documentary photography. Given an article, you describe ONE concrete photographic scene that would accompany it as a hero image.
+
+Constraints — every prompt MUST:
+- Name a specific, real-world physical environment (clinic interior, gym, lab bench, bedroom, kitchen counter, mountain trail, etc.)
+- Name specific concrete objects in the frame (not abstract concepts)
+- Specify lighting (window light, golden hour, overhead industrial, moonlight, etc.)
+- Specify camera angle / composition (low angle, overhead flat-lay, macro close-up, wide shot, etc.)
+
+Constraints — every prompt MUST NOT include:
+- Bottles, vials, jars, ampoules, syringes, pills, or pharmaceutical packaging
+- Shelves with bottles arranged on them
+- Skincare flat-lays or "wellness aesthetic" still lifes
+- Identifiable human faces
+- Text, labels, logos, or watermarks
+- Words like "wellness", "luxury", "premium", or "boutique"
+
+The scene MUST visually evoke the article's actual subject matter and stay strictly within its niche. Examples:
+- ligament repair / recovery → a physiotherapy rehab clinic with a treatment bench
+- growth hormone / performance → a strength-training gym, loaded barbell
+- sleep / circadian → a bedroom at night, moonlight through curtains
+- gym opening / membership → a new fitness facility interior, cardio + weight equipment, sign-up desk
+- roofing → a residential roof mid-replacement, shingles, ladder, roofing tools
+- tax law / IRS / Revenu Québec → a law office desk with legal code books and tax documents
+- pest control → a technician's sprayer + inspection flashlight on a home floor, baseboard visible
+- charity / nonprofit → a community food-bank sorting table stacked with donations
+
+Never drift to an unrelated domain. A gym article must NOT show a lab; a roofing article must NOT show an office; a tax article must NOT show a gym.
+
+Output: ONE sentence, 25-60 words, describing the scene. Plain text only. No quotes, no preamble.`;
+
+  const user = `ARTICLE TITLE: ${title}
+
+KEYWORDS: ${keywords.slice(0, 8).join(", ")}
+
+ARTICLE EXCERPT (first ~2000 chars):
+${plain}
+
+Describe the photographic scene for the hero image.`;
+
+  try {
+    const { text } = await callClaude(system, user, {
+      maxTokens: 200,
+      temperature: 0.8,
+    });
+    const cleaned = text.trim().replace(/^["']|["']$/g, "");
+    if (cleaned.length < 20 || cleaned.length > 600) return null;
+    return cleaned;
+  } catch (err) {
+    console.warn("[content-generator] Scene summarization failed:", err);
+    return null;
+  }
+}
+
+// ─── Prompt builders ────────────────────────────────────────────────────────
+
+function getNicheRequirements(niche: string): string {
+  const key = normalizeNicheKey(niche) ?? "";
+  const requirements: Record<string, string> = {
+    peptides: `Reference actual published studies. Use proper terminology with explanations. Cite dosage ranges from research, not anecdotes. Acknowledge limitations and unknowns. Distinguish between animal studies, human trials, and theoretical applications. Include medical disclaimers. Never recommend sources or suppliers. Be clear about regulatory status.`,
+    gambling: `Cover BOTH sports betting and online casino under one roof. SPORTS BETTING: use real odds examples and specific numbers, reference statistical concepts accurately (EV, variance, ROI, CLV), acknowledge most bettors lose long-term. ONLINE CASINO: use real RTP percentages (95-97% slots, ~99.5% blackjack basic strategy, 98.65% European roulette), reference actual game providers (Pragmatic Play, NetEnt, Evolution, Microgaming), be precise about wagering requirements (35x bonus + deposit, max bet caps, game contribution percentages), acknowledge the house edge openly and never frame casino games as positive-EV. Include a responsible gambling framework naturally (deposit limits, self-exclusion). Distinguish regulated jurisdictions (UKGC, MGA, Ontario AGCO, Loto-Québec) from offshore operators. Never promote gambling as guaranteed income and never recommend operators to bypass regulation.`,
+    web_dev: `Reference actual tools and versions (React 18, Node 20 LTS). Address real trade-offs. Include both happy path and common issues. Compare modern vs legacy approaches honestly. Mention browser compatibility when relevant.`,
+    payment_processing: `Use correct terminology (interchange, acquirer, PSP, basis points). Cite actual fee structures with real numbers. Include hidden fees and contract terms. Address compliance requirements (PCI DSS). Acknowledge regional regulatory differences.`,
+    loans: `Use correct financial terminology (APR, LTV, DTI). Show total cost of loan, not just monthly payment. Address predatory lending red flags. Include qualification requirements honestly. Distinguish between loan types and their implications.`,
+    construction: `Use correct construction terminology (GC, sub, bid process). Include real cost ranges by project scale. Reference regulatory requirements (permits, OSHA, prevailing wage). Acknowledge regional differences. Address business-side concerns (cash flow, payment terms).`,
+    reputation_sites: `Reference actual platforms (Trustpilot, Yelp, Google Reviews, BBB, G2). Address both business and consumer viewpoints. Never promote fake review services or manipulation. Distinguish authentic reviews from suspicious patterns. Focus on ethical response strategies.`,
+    apps_marketing: `Include actual pricing and version numbers. Acknowledge platform differences (iOS vs Android). Mention real limitations and bugs honestly. Reference actual user feedback. Compare based on what people care about: speed, reliability, cost, privacy.`,
+    exclusive_models: `Frame as creator entrepreneurship, not explicit content. Focus on marketing, monetization, branding. Include real platform fees and earnings ranges. Respect creator autonomy. Address platform risks honestly. Never overpromise income potential.`,
+    ecom_nails: `Use correct product terminology (gel polish vs builder gel). Reference actual brands with real prices. Include timing (cure times, wear duration). Describe looks specifically with shade names and finish types. Address nail health honestly.`,
+    soccer_jersey: `Distinguish authentic vs replica vs counterfeit. Reference actual manufacturers (Nike, Adidas, Puma). Use proper terminology (kit, strip, home/away/third). Address sizing by manufacturer. Never promote counterfeit sources.`,
+    app_dev: `Distinguish native (Swift/Kotlin), cross-platform (React Native/Flutter), hybrid. Include realistic cost ranges and timelines. Cover iOS and Android considerations. Address ongoing costs (hosting, APIs, maintenance). Acknowledge market saturation.`,
+    tax_lawyer: `Cite specific IRC sections and real penalty amounts. Use concrete dollar figures and timelines (e.g. "10-year CSED on tax debt"). Distinguish federal vs state procedures. Always include a "general information, not legal advice — consult a licensed attorney for your situation" disclaimer. Address common myths honestly (e.g. pennies-on-the-dollar OIC marketing claims).`,
+    charity: `Reference actual 501(c)(3) compliance requirements and IRS Form 990 specifics. Use real benchmarks for overhead ratios, donor retention rates, and grant award sizes. Cite specific grant databases (Candid, Grants.gov). Distinguish program vs administrative vs fundraising expenses. Acknowledge sector-wide challenges (donor fatigue, restricted funding) honestly.`,
+    pest_extermination: `Use correct entomological names (German vs American cockroach, Eastern vs Western subterranean termite). Reference actual products and active ingredients (fipronil in Termidor, indoxacarb in Advion). Distinguish DIY-feasible vs licensed-only treatments. Address pet and child safety explicitly. Include realistic timelines (bed bug eradication takes 2-3 treatments over 4-6 weeks).`,
+    roofing: `Distinguish material types with real per-square cost ranges (asphalt $350-550, metal $900-1400, tile $1000-1800). Reference manufacturer warranties (GAF, Owens Corning, CertainTeed) honestly including pro-rated vs non-prorated terms. Address regional climate factors (snow load, hurricane straps, hail belts). Walk through insurance claim process realistically — what insurers cover vs deny.`,
+    online_casino: `Use real RTP percentages (95-97% for slots, 99.5% for blackjack basic strategy, 98.65% European roulette). Reference actual game providers (Pragmatic Play, NetEnt, Evolution, Microgaming) and a few specific top-grossing titles. Be precise about wagering requirements (35x bonus + deposit, max bet caps, game contribution percentages). Acknowledge house edge openly — never frame casino games as positive-EV. Include responsible-gambling language naturally (deposit limits, self-exclusion, GamCare/National Council on Problem Gambling references). Distinguish regulated jurisdictions (UKGC, MGA, NJ DGE, Ontario AGCO) from offshore operators. Never recommend specific operators to bypass regulation.`,
+    real_estate: `Use concrete numbers — median sale prices, $/sq ft, days-on-market, price-to-rent ratios. Reference real data sources (NAR, Zillow Research, FRED, S&P CoreLogic Case-Shiller, CMHC for Canada). Distinguish residential vs commercial vs mixed-use. Include realistic transaction costs (6% agent split, 2-5% closing). Cover mortgage mechanics accurately (DTI < 43% conforming, LTV affecting PMI, 30-year vs 15-year). Address regional variation honestly — pricing in Toronto vs Montréal vs rural Quebec differs sharply. For investor content, cover cap rate / cash-on-cash / 1% rule with real ranges, not generic platitudes. Never give specific legal or tax advice — frame as general information.`,
+    gym_subscription: `Use actual chain pricing (Planet Fitness $15/$25 tiers, Equinox $200-$300, LA Fitness ~$30). Address contract gotchas (annual fees, cancellation requirements, auto-renewal). Distinguish big-box vs boutique vs class-based models honestly. Include realistic personal training costs ($60-150/session). Address common frustrations (overcrowding, equipment availability, cancellation friction).`,
+    gym_franchise: `Focus on NEW gym launches and franchise openings — NOT ongoing membership comparison (that's the gym_subscription niche). Cover ribbon-cutting dates, the franchise owner's background, equipment partners, opening-day promotions (first-month-free deals, founder discounts), location-specific build-out timing, and how this opening fits the local fitness scene. Name specific local chains by their real names — in Quebec: Énergie Cardio, Éconofitness, Nautilus Plus, Buzzfit, World Gym. Distinguish franchise vs corporate vs independent operations. When local news headlines about gym openings or industry shifts are provided in the prompt, cite them as inline links — this niche lives or dies on locally relevant news context.`,
+  };
+  return requirements[key] || "";
+}
+
+/**
+ * Resolve a vertical's language setting into the CONCRETE language for
+ * a single post.
+ *
+ *   "fr"    → always French
+ *   "en"    → always English
+ *   "en_fr" → bilingual vertical: pick ONE language per post (50/50
+ *             coin flip). Each post is cleanly single-language; over
+ *             many posts the blog accumulates both — which is what
+ *             "bilingual" means for SEO (NOT mixing both in one post).
+ *
+ * Call this ONCE per generation at the action layer, then pass the
+ * resolved value to BOTH ideateTopic and generateContent so the topic
+ * and the article are in the same language.
+ */
+export function resolvePostLanguage(
+  language: "en" | "fr" | "en_fr" | null | undefined,
+): "en" | "fr" {
+  if (language === "fr") return "fr";
+  if (language === "en_fr") return Math.random() < 0.5 ? "fr" : "en";
+  return "en";
+}
+
+/**
+ * Estimated cost (USD) for ONE Gemini image generation, based on the
+ * configured GOOGLE_IMAGE_MODEL. Used by the per-post cost log — the
+ * actual image cost isn't tracked through the publish pipeline (Gemini's
+ * REST API doesn't return a billable-token count), so this is a heuristic
+ * keyed off the model id we know we asked for. Pricing source:
+ * https://ai.google.dev/pricing (verify before relying on cost reporting).
+ */
+const IMAGE_COST_USD: Record<string, number> = {
+  "gemini-3-pro-image-preview": 0.13,
+  "gemini-3-flash-image-preview": 0.04,
+  "gemini-2.5-flash-image": 0.04,
+};
+
+export function estimateImageCostUsd(): number {
+  const model = process.env.GOOGLE_IMAGE_MODEL || "gemini-3-flash-image-preview";
+  return IMAGE_COST_USD[model] ?? 0.04;
+}
+
+/**
+ * Niche keys whose blogs publish in French regardless of TLD or vertical
+ * config. Highest-priority override in postLanguageForDomain. Both
+ * gambling sub-niches (sportsbook + online casino) are operator-locked
+ * to French for the Quebec market.
+ */
+const FRENCH_ONLY_NICHE_KEYS = new Set(["gambling", "online_casino"]);
+
+/**
+ * Language resolution, in priority order — first match wins:
+ *   1. Niche in FRENCH_ONLY_NICHE_KEYS → ALWAYS French (gambling family).
+ *   2. Domain ends in .com            → ALWAYS English (US / international).
+ *   3. Otherwise                       → vertical's configured language
+ *      via resolvePostLanguage. en_fr verticals coin-flip per post; each
+ *      post is single-language, never mixed.
+ */
+export function postLanguageForDomain(
+  verticalLanguage: "en" | "fr" | "en_fr" | null | undefined,
+  domain: string,
+  niche?: string | null,
+): "en" | "fr" {
+  // 1. Niche override — gambling family always French.
+  const normalizedNiche = (niche || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (FRENCH_ONLY_NICHE_KEYS.has(normalizedNiche)) {
+    return "fr";
+  }
+
+  // 2. TLD override — .com forces English.
+  const cleanDomain = (domain || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .split("/")[0]
+    .replace(/:\d+$/, "");
+  if (cleanDomain.endsWith(".com")) {
+    return "en";
+  }
+
+  // 3. Default — vertical's configured language.
+  return resolvePostLanguage(verticalLanguage);
+}
+
+/**
+ * Build a language directive appended to the system prompt. Empty for
+ * English. For French it forces the ENTIRE JSON payload — title,
+ * content, excerpt, metaTitle, metaDescription, keywords — into Québec
+ * French. Callers should resolve "en_fr" to a concrete "en"/"fr" via
+ * resolvePostLanguage() before this is reached.
+ */
+function buildLanguageDirective(
+  language: GenerateOptions["language"],
+): string {
+  if (language === "fr") {
+    return `
+
+LANGUE / LANGUAGE — CRITICAL:
+- Write the ENTIRE article in FRENCH (français). This is a French-
+  language blog for a Québec audience.
+- Every JSON field must be in French: "title", "content", "excerpt",
+  "metaTitle", "metaDescription", AND the "keywords" array.
+- Use natural Québec French phrasing and vocabulary, not literal
+  English-to-French translation. Prices in CAD ($), dates in French
+  format, French punctuation conventions.
+- Industry/brand/technical terms with no common French equivalent may
+  stay in English (e.g. product names, "GLP-1", "shingles"), but the
+  surrounding sentence MUST be French.
+- Do NOT write whole sentences or paragraphs in English.`;
+  }
+  // "en", "en_fr" (should have been resolved already), or undefined →
+  // English, no directive.
+  return "";
+}
+
+// ─── Per-blog stylistic seeding (legacy / non-profile path) ─────────────────
+//
+// Same blog → same picks every time. Lets the legacy path approach the
+// profile-path's per-blog diversification without the full composer stack.
+// Per the footprint audit: shared voice fingerprint across a niche is the
+// easiest network pattern for a classifier to find — these helpers break it.
+
+const QUIRK_POOL: string[] = [
+  "Occasionally drop a single-sentence paragraph for emphasis (max 2–3 per article).",
+  "Use parentheticals (like this one) more than average — 3–5 per article.",
+  "Open roughly 30% of paragraphs with a question.",
+  "Use heavy parallel construction in some sections, then deliberately break it elsewhere.",
+  "Prefer numerals (3) over spelled-out numbers (three), even at sentence starts.",
+  "Use specific timeframes frequently: 'in 2014,' 'by 2019,' 'as of late 2022.'",
+  "Mid-paragraph self-correction: 'Actually, that's imprecise — more accurately...'",
+  "Use sentence fragments for emphasis. Sparingly. Like this.",
+  "Prefer 'Note that...' or 'Consider...' as section openers in technical passages.",
+  "Use first-person plural ('we') rather than second-person ('you') when explaining concepts.",
+  "Avoid the colon-before-list pattern. Lead with a sentence ending in a period.",
+  "Use 'I' once or twice per article to inject authorial voice — sparingly.",
+];
+
+/** Small deterministic 32-bit hash of a string. Stable across processes. */
+function hashSeed(seed: string): number {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) {
+    h = ((h << 5) - h + seed.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h);
+}
+
+/** Pick `count` distinct quirks from QUIRK_POOL deterministically by seed. */
+function pickQuirks(seed: string | undefined, count = 2): string[] {
+  if (!seed) return [];
+  const base = hashSeed(seed);
+  const picks: string[] = [];
+  const used = new Set<number>();
+  for (let i = 0; i < count; i++) {
+    let idx = (base + i * 31) % QUIRK_POOL.length;
+    // De-collision: walk forward until we find an unused slot.
+    while (used.has(idx)) idx = (idx + 1) % QUIRK_POOL.length;
+    used.add(idx);
+    picks.push(QUIRK_POOL[idx]);
+  }
+  return picks;
+}
+
+/**
+ * Per-blog word band drawn from inside the network bounds
+ * [GLOBAL_WORD_BAND_MIN, GLOBAL_WORD_BAND_MAX]. Each blog gets a stable
+ * (~300-word-wide) sub-range so the network doesn't cluster on uniform
+ * word counts. Falls back to the network bounds when no seed is provided.
+ */
+function wordBandForBlog(
+  seed: string | undefined,
+  requestedTarget: number,
+): { min: number; max: number; target: number } {
+  const lo = MIN_WORDS;
+  const hi = MAX_WORDS;
+  if (!seed) {
+    const target = Math.max(lo, Math.min(hi, requestedTarget));
+    return { min: lo, max: hi, target };
+  }
+  const span = hi - lo; // e.g. 700
+  const bandWidth = Math.max(250, Math.round(span * 0.35)); // ~245+
+  const h = hashSeed(seed);
+  // Deterministic start offset such that [start, start + bandWidth] ⊆ [lo, hi].
+  const start = lo + (h % Math.max(1, span - bandWidth));
+  const min = start;
+  const max = start + bandWidth;
+  const target = Math.round((min + max) / 2);
+  return { min, max, target };
+}
+
+/**
+ * Per-blog body-image wrapper class (used by embedBodyImage). Different
+ * sites should emit different markup; identical class names across the
+ * network are a trivial HTML fingerprint per the audit.
+ */
+function bodyImageClassForBlog(seed: string | undefined): string {
+  const POOL = [
+    "post-figure",
+    "inline-illustration",
+    "article-figure",
+    "story-image",
+    "post-illustration",
+    "body-figure",
+    "feature-image",
+    "content-figure",
+  ];
+  if (!seed) return POOL[0];
+  return POOL[hashSeed(seed) % POOL.length];
+}
+
+/**
+ * Per-blog `rel` value for outbound links. A network where every external
+ * link is `rel="noopener nofollow"` is a trivial fingerprint; real sites
+ * vary in how (and whether) they nofollow/sponsor outbound links. Same blog
+ * → same rel always. `noopener` is always present (security), the
+ * follow/nofollow signalling rotates.
+ */
+function relForBlog(seed: string | undefined): string {
+  const POOL = [
+    "noopener nofollow",
+    "noopener",
+    "nofollow noopener",
+    "noopener noreferrer nofollow",
+    "external nofollow noopener",
+    "noopener ugc",
+  ];
+  if (!seed) return POOL[0];
+  return POOL[hashSeed(seed) % POOL.length];
+}
+
+/**
+ * Per-blog CTA button appearance. Identical inline-styled buttons across the
+ * network are an obvious footprint (footprint audit). Each blog gets a stable
+ * colour/padding/radius/weight drawn deterministically from its seed, so the
+ * serialized HTML differs site-to-site while every button still renders as a
+ * tasteful dark pill. Same blog → same button always.
+ */
+function ctaStyleForBlog(seed: string | undefined): {
+  bg: string;
+  padding: string;
+  radius: string;
+  weight: string;
+  fontSize: string;
+  align: string;
+  margin: string;
+} {
+  const BG = ["#111827", "#0f172a", "#1f2937", "#18181b", "#1e293b", "#0b1220", "#171717"];
+  const PADDING = ["14px 30px", "13px 28px", "15px 32px", "12px 26px", "14px 34px"];
+  const RADIUS = ["8px", "6px", "10px", "4px", "9999px"];
+  const WEIGHT = ["600", "700", "500"];
+  const FONT = ["16px", "15px", "17px"];
+  const MARGIN = ["2.5em 0", "2.25em 0", "2.75em 0", "2em 0"];
+  if (!seed) {
+    return {
+      bg: BG[0], padding: PADDING[0], radius: RADIUS[0],
+      weight: WEIGHT[0], fontSize: FONT[0], align: "center", margin: MARGIN[0],
+    };
+  }
+  const h = hashSeed(seed);
+  return {
+    bg: BG[h % BG.length],
+    padding: PADDING[(h >> 2) % PADDING.length],
+    radius: RADIUS[(h >> 4) % RADIUS.length],
+    weight: WEIGHT[(h >> 6) % WEIGHT.length],
+    fontSize: FONT[(h >> 8) % FONT.length],
+    align: (h >> 10) % 4 === 0 ? "left" : "center",
+    margin: MARGIN[(h >> 11) % MARGIN.length],
+  };
+}
+
+function buildSystemPrompt(opts: GenerateOptions): string {
+  const niche = getNicheContext(opts.niche);
+  const brandVoice = opts.brandVoice || niche.defaultBrandVoice;
+  const audience = opts.targetAudience || niche.defaultAudience;
+  // Per-blog word band — same seed → same band always. The opts.wordCount
+  // is treated as a hint; the per-blog band overrides it so the network
+  // doesn't cluster on a uniform target.
+  const wb = wordBandForBlog(opts.blogSeed, opts.wordCount);
+  const targetWords = wb.target;
+  // Per-blog stylistic tics — picked deterministically from QUIRK_POOL by
+  // blogSeed. Same blog always writes with the same 2 quirks.
+  const quirks = pickQuirks(opts.blogSeed, 2);
+
+  let prompt = `You are an expert content writer in the ${niche.industry} space. Write a comprehensive, original article that reads like it was written by someone with deep first-hand experience.
+
+VOICE & STYLE:
+- Brand voice: ${brandVoice}
+- Audience: ${audience}
+- Tone: ${opts.tone}
+- Style: ${niche.contentStyle}
+
+QUALITY BAR:
+- Specific over generic — exact prices, real brand/tool names, concrete numbers
+- Show your reasoning, don't just assert
+- Include trade-offs and limitations honestly, not just upsides
+
+FORBIDDEN AI TELLS (will cause the post to be rejected):
+
+Punctuation:
+- NEVER use em-dashes (—) or en-dashes (–) as pause markers. Replace with periods, commas, or sentence breaks.
+- NEVER use the single-character ellipsis (…). Use three periods (...).
+- NEVER use curly/smart quotes (" " ' '). Use straight quotes (" and ').
+
+Forbidden vocabulary (do not appear in any context):
+delve, tapestry, realm, ecosystem (as metaphor), landscape (as metaphor), journey (as metaphor), navigate (as metaphor), unleash, harness, foster, cultivate, embark, robust, seamless, holistic, nuanced, paradigm, multifaceted, intricate, pivotal, plethora, myriad, gleaned, meticulous, underscore, bolster, garner.
+
+Forbidden phrases (never include any of these):
+- "It's not just X, it's Y"
+- "Whether you're X or Y..."
+- "In today's [world / fast-paced / digital / modern]..."
+- "Game-changer", "Revolutionary", "Transformative"
+- "It's worth noting that"
+- "That said," / "With that in mind"
+- "Look no further" / "Without further ado"
+- "When it comes to"
+- "Let's dive in" / "Let's explore"
+- "At its core"
+- Sentence-initial: "Ultimately," / "Fundamentally," / "Essentially,"
+- "The key takeaway"
+- Sign-off lines like "Happy [verbing]!"
+- Filler transitions: "Moreover," "Furthermore," "In conclusion"
+
+Forbidden structural patterns:
+- Do NOT make every paragraph exactly 3 or 4 sentences. Vary paragraph length deliberately: some single-sentence paragraphs for emphasis, some 5–7 sentence paragraphs, some short.
+- Do NOT use perfect parallel structure in every list. Real writers break parallelism naturally.
+- Do NOT open with a time-anchored cliché ("In today's...", "In an era of...").
+- Do NOT close with "In conclusion" or a recap paragraph.
+
+CADENCE TARGET:
+- Average sentence length: 15–20 words.
+- HIGH variance: include at least 3–5 sentences under 10 words AND at least 2–3 sentences over 25 words.
+- Paragraphs vary between 1 and 7 sentences.
+
+WORD COUNT (HARD LIMITS):
+- Minimum ${wb.min} words — anything shorter will be rejected.
+- Maximum ${wb.max} words — leave a 200–300-word buffer below the maximum so the JSON can't be truncated mid-string.
+- Target approximately ${targetWords} words.
+- Depth over padding; trim ruthlessly before approaching the cap.
+
+IMAGES:
+- Do NOT include any <img>, <figure>, <picture>, or <figcaption> tags in your output. A hero image is attached as the article's featured image at publish time — any inline images you emit will be stripped.
+
+STRUCTURE:
+- Open with a substantive hook (no time-anchored opener).
+- Use <h2> for major sections, <h3> for subsections.
+- Lists where useful, not where padding.
+- Close with concrete takeaways, not platitudes.
+
+OUTPUT FORMAT:
+Return ONLY valid JSON with EXACTLY these top-level keys:
+{
+  "title": "Article title, primary keyword first, ~50 characters, no site/brand name",
+  "content": "Full HTML article between ${wb.min} and ${wb.max} words",
+  "excerpt": "150-160 character summary",
+  "metaTitle": "SEO title tag, primary keyword FIRST, ~50 characters max (must render under 580px). Use ' | ' not '-' as a separator. No brand/site name, no duplicate words.",
+  "metaDescription": "Meta description, primary keyword early, ~140 characters max (must render under 1000px). One natural sentence ending with a soft call to action.",
+  "keywords": ["keyword1", "keyword2", "keyword3"]
+}
+
+JSON SHAPE — strict:
+- "content" is ONE HTML string. Do not split into "intro"/"items"/"sections"/"paragraphs"/"deck"/"body"+"conclusion". Build one HTML string.
+- Do not wrap the response in another object ({"article": ...}). Return the JSON directly.
+- Use field names exactly as shown ("content" not "html"/"body"/"article_html"; "title" not "headline"/"post_title").
+- Allowed tags in "content": <h2>, <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <a>. No images, no markdown headings.`;
+
+  if (quirks.length > 0) {
+    prompt += `\n\nTHIS BLOG'S WRITING HABITS (apply consistently across the article):\n${quirks.map((q) => `- ${q}`).join("\n")}`;
+  }
+
+  const nicheReqs = opts.niche ? getNicheRequirements(opts.niche) : "";
+  if (nicheReqs) {
+    prompt += `\n\nNICHE-SPECIFIC REQUIREMENTS:\n${nicheReqs}`;
+  }
+
+  // SEO REQUIREMENTS block removed per the footprint audit (insight 2):
+  // "Natural keyword density 1-2%" / "primary keyword in first 100 words"
+  // optimize to exactly what classifiers fingerprint. The structure rules
+  // above are enough; entity coverage + uniqueness is the right replacement
+  // (separate follow-up). Keeping seoOptimized for back-compat / future use.
+  if (opts.seoOptimized) {
+    // Intentionally a no-op for now — see comment above.
+  }
+
+  return prompt;
+}
+
+/**
+ * On-page quality rules appended to every article-generation system prompt
+ * (both the profile and legacy paths). Phrased as natural-language ceilings,
+ * not mechanical SEO knobs (no keyword-density / "keyword in first 100 words"
+ * rules — those are AI-detector fingerprints, deliberately avoided).
+ */
+const SEO_QUALITY_DIRECTIVE = `
+
+ON-PAGE QUALITY (apply throughout the article):
+- Keep the AVERAGE sentence length at or below ~20 words (shorter is fine; vary length for rhythm). Break up any single sentence that runs past ~28 words into two.
+- Every <h2>/<h3> heading must have UNIQUE text — never repeat the same heading wording, and do not restate the article title as a heading.
+- Every hyperlink must use UNIQUE, descriptive anchor text — never reuse the same anchor wording for two links, and don't use an anchor that merely repeats a heading.
+- Make the opening paragraph clearly on-topic: reference the article's main subject naturally in the first few sentences.`;
+
+/**
+ * Build the styled call-to-action button appended to the bottom of a post.
+ * Inline CSS so it renders as a button on any theme. Returns "" when the CTA
+ * is incomplete or the URL isn't a safe http(s) link.
+ */
+function buildCtaHtml(
+  cta?: { label: string; url: string },
+  seed?: string,
+): string {
+  const label = (cta?.label ?? "").trim();
+  const url = (cta?.url ?? "").trim();
+  if (!label || !/^https?:\/\//i.test(url)) return "";
+
+  const safeLabel = label
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  const safeUrl = url.replace(/"/g, "%22").replace(/</g, "%3C").replace(/>/g, "%3E");
+
+  // Per-blog button appearance + rel so the CTA markup isn't byte-identical
+  // across the network. Same blog → same button always.
+  const s = ctaStyleForBlog(seed);
+  const rel = relForBlog(seed);
+
+  return (
+    `\n<div style="text-align:${s.align};margin:${s.margin};">` +
+    `<a href="${safeUrl}" target="_blank" rel="${rel}" ` +
+    `style="display:inline-block;padding:${s.padding};background:${s.bg};color:#ffffff;` +
+    `font-weight:${s.weight};font-size:${s.fontSize};text-decoration:none;border-radius:${s.radius};">` +
+    `${safeLabel}</a></div>`
+  );
+}
+
+/** Positions for the CTA from a placement preset. */
+function ctaPositions(placement?: string): Array<"top" | "middle" | "bottom"> {
+  if (placement === "top_bottom") return ["top", "bottom"];
+  if (placement === "top_middle_bottom") return ["top", "middle", "bottom"];
+  return ["bottom"];
+}
+
+/** Insert an HTML snippet at the ~50% word-count point, on a paragraph boundary. */
+function insertHtmlAtMidpoint(html: string, snippet: string): string {
+  const parts = html.split(/(<\/p>)/i);
+  const paragraphs: Array<{ html: string; words: number }> = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const combined = (parts[i] ?? "") + (parts[i + 1] ?? "");
+    if (combined.trim().length === 0) continue;
+    const words = combined.replace(/<[^>]+>/g, " ").trim().split(/\s+/).filter(Boolean).length;
+    paragraphs.push({ html: combined, words });
+  }
+  if (paragraphs.length < 4) return html + snippet; // too short for a sensible midpoint
+  const total = paragraphs.reduce((s, p) => s + p.words, 0);
+  let acc = 0;
+  let insertAt = paragraphs.length - 1;
+  for (let i = 0; i < paragraphs.length; i++) {
+    acc += paragraphs[i].words;
+    if (acc >= total / 2) {
+      insertAt = i + 1;
+      break;
+    }
+  }
+  return (
+    paragraphs.slice(0, insertAt).map((p) => p.html).join("") +
+    snippet +
+    paragraphs.slice(insertAt).map((p) => p.html).join("")
+  );
+}
+
+/** Inject the client's CTA button at its configured position(s). */
+function injectCta(
+  body: string,
+  cta?: GenerateOptions["cta"],
+  seed?: string,
+): string {
+  if (!cta) return body;
+  const button = buildCtaHtml(cta, seed);
+  if (!button) return body;
+
+  const positions = ctaPositions(cta.placement);
+  let out = body;
+  // Middle first, so the top/bottom buttons don't skew the midpoint math.
+  if (positions.includes("middle")) out = insertHtmlAtMidpoint(out, button);
+  if (positions.includes("top")) out = button + out;
+  if (positions.includes("bottom")) out = out + button;
+  return out;
+}
+
+/**
+ * Render the client's Knowledge Base summaries into a system-prompt block.
+ * Returns "" when there's nothing to inject.
+ */
+function buildKnowledgeContext(summaries?: string[]): string {
+  const list = (summaries ?? []).map((s) => s.trim()).filter(Boolean);
+  if (list.length === 0) return "";
+  return (
+    `\n\nCLIENT KNOWLEDGE BASE — reference material this client provided. Draw on these facts, terminology, and context wherever they fit the topic, and never contradict them:\n` +
+    list.map((s) => `- ${s}`).join("\n")
+  );
+}
+
+function buildUserPrompt(opts: GenerateOptions): string {
+  return `Write the article.
+
+Topic: ${opts.topic}
+Target keywords: ${opts.keywords.join(", ") || "(infer from topic)"}
+
+Begin now. Return only the JSON object.`;
+}
+
+// ─── Topic ideation (used by cron auto-publish) ─────────────────────────────
+
+/**
+ * Render the client's distilled Knowledge Base into a prompt section that
+ * tells the model to prioritize the client's own topics/keywords. Returns ""
+ * when there's nothing to inject (blogs with no active knowledge documents).
+ */
+function buildKnowledgeSection(
+  knowledge?: { keywords: string[]; topics: string[] },
+): string {
+  const topics = knowledge?.topics?.filter(Boolean).slice(0, 20) ?? [];
+  const keywords = knowledge?.keywords?.filter(Boolean).slice(0, 40) ?? [];
+  if (topics.length === 0 && keywords.length === 0) return "";
+
+  return (
+    `\n\nCLIENT KNOWLEDGE BASE (uploaded reference material — prioritize this over generic niche topics):\n` +
+    (topics.length ? `  priority topics: ${topics.join(", ")}\n` : "") +
+    (keywords.length ? `  target keywords: ${keywords.join(", ")}\n` : "") +
+    `Prefer a topic and keywords that align with the client's own material above whenever it fits the niche.`
+  );
+}
+
+export async function ideateTopic(
+  niche: string | null | undefined,
+  recentTitles: string[],
+  opts: {
+    verticalKey?: string | null;
+    /**
+     * Per-blog locked style profile. When provided, the topic ideation
+     * anchors on this blog's UNIQUE primaryCompounds and locked
+     * sub-niche instead of the niche's generic keyTopics list. Without
+     * this, every blog's first post (no recent titles) defaulted to
+     * the first compound in keyTopics (BPC-157 for peptides) — every
+     * peptide blog ended up starting with the same topic.
+     */
+    styleProfile?: StyleProfile;
+    /** Output language — French verticals get French topics + keywords. */
+    language?: "en" | "fr" | "en_fr";
+    /**
+     * Distilled client Knowledge Base for this blog (uploaded reference
+     * material — briefs, keyword sheets, etc.). When present, ideation
+     * prioritizes the client's own topics/keywords over the generic niche
+     * list, so posts reflect the material the client actually gave us.
+     */
+    knowledge?: { keywords: string[]; topics: string[] };
+  } = {},
+): Promise<{ topic: string; keywords: string[] }> {
+  const ctx = getNicheContext(niche);
+  const recentList = recentTitles.length
+    ? recentTitles.slice(0, 20).map((t) => `- ${t}`).join("\n")
+    : "(none yet — first post for this blog)";
+
+  // Pull recent news headlines for this vertical (if registered + has
+  // cached items). Cron `/api/cron/refresh-news` keeps the cache fresh
+  // daily. Returns empty string when no vertical or no items — ideation
+  // falls back to its cold-start behavior.
+  let newsBlock = "";
+  if (opts.verticalKey) {
+    try {
+      const items = await takeNewsContextForVertical(opts.verticalKey, 6);
+      if (items.length > 0) {
+        newsBlock = await formatNewsContextForPrompt(items);
+      }
+    } catch (err) {
+      // Non-fatal — ideation should still produce a topic even if the
+      // news lookup or marking fails.
+      console.warn(
+        "[ideateTopic] news context lookup failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  const newsClause = newsBlock
+    ? `- Tie the topic to a current news angle when one of the recent headlines fits naturally\n- Skip the news angle entirely if no headline relates to the niche`
+    : "";
+
+  // Profile-aware focus anchor. When a style profile is present, force
+  // the topic to center on this blog's UNIQUE primary/secondary
+  // compounds and locked sub-niche. This is what makes each peptide
+  // blog's first post unique — the random assignment algorithm gave
+  // every blog a different 2-compound primary canon, so anchoring
+  // ideation on those compounds guarantees blog-level uniqueness even
+  // when recentTitles is empty.
+  //
+  // When no profile (non-peptide blogs), fall back to the niche's
+  // generic keyTopics list.
+  let focusLine: string;
+  let profileAnchorSection = "";
+  if (opts.styleProfile) {
+    const sp = opts.styleProfile;
+    const subNiche = SUB_NICHES[sp.subNicheId];
+    const subNicheName = subNiche?.name ?? "general";
+    const primary = sp.primaryCompounds.length
+      ? sp.primaryCompounds.join(", ")
+      : "(none specified)";
+    const secondary = sp.secondaryCompounds.length
+      ? sp.secondaryCompounds.join(", ")
+      : "(none specified)";
+
+    focusLine =
+      `- Anchor the topic on ONE of THIS BLOG'S primary compounds: ${primary}\n` +
+      `- Stay strictly within the "${subNicheName}" sub-niche\n` +
+      `- Secondary compounds available for comparison/stack context: ${secondary}`;
+
+    profileAnchorSection =
+      `\n\nBLOG-SPECIFIC CANON (this blog's locked profile — DO NOT drift):\n` +
+      `  sub-niche: ${subNicheName}\n` +
+      `  primary compounds: ${primary}\n` +
+      `  secondary compounds: ${secondary}\n` +
+      `Every peptide blog in this network has a different primary-compound\n` +
+      `pair, which is what makes each site unique. The topic you suggest\n` +
+      `MUST center on one of the two primary compounds above — do not\n` +
+      `default to BPC-157 / TB-500 / semaglutide unless those are in the\n` +
+      `primary list. Picking a compound outside this canon breaks the\n` +
+      `network's per-blog distinctiveness.`;
+  } else if (ctx.keyTopics.length > 0) {
+    focusLine = `- Cover the niche's key topics: ${ctx.keyTopics.join(", ")}`;
+  } else {
+    focusLine = `- Stay tightly focused on the ${ctx.label} niche — do not drift into adjacent industries`;
+  }
+
+  const languageClause =
+    opts.language === "fr"
+      ? `\n- Write the "topic" AND every "keywords" entry in FRENCH (français), Québec phrasing — this is a French-language blog`
+      : "";
+
+  const system = `You generate fresh blog post topic ideas for a ${ctx.industry} niche site (${ctx.label}). Suggest topics that:
+${focusLine}
+- Do NOT overlap with recent titles
+- Have clear search intent
+- Are specific (not generic listicles)${languageClause}
+${newsClause}
+
+Return JSON only:
+{ "topic": "Specific topic for the article", "keywords": ["kw1", "kw2", "kw3"] }`;
+
+  const newsSection = newsBlock
+    ? `\n\nRecent news headlines relevant to this vertical (last 72 hours):\n${newsBlock}`
+    : "";
+
+  const knowledgeSection = buildKnowledgeSection(opts.knowledge);
+
+  const user = `Recent titles on this site (avoid duplicating these):
+${recentList}${profileAnchorSection}${knowledgeSection}${newsSection}
+
+Suggest the next post's topic.`;
+
+  const { text } = await callClaude(system, user, {
+    maxTokens: 300,
+    temperature: 0.9,
+    expectJson: true,
+  });
+
+  try {
+    const parsed = safeParseClaudeJson<{ topic?: unknown; keywords?: unknown }>(text);
+    return {
+      topic: String(parsed.topic || "").slice(0, 500),
+      keywords: Array.isArray(parsed.keywords) ? parsed.keywords.map(String) : [],
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "parse error";
+    throw new Error(
+      `Topic ideation returned invalid JSON: ${msg} | response preview: ${text.slice(0, 200)}`,
+    );
+  }
+}
+
+// ─── Keyword suggestion (manual "Suggest keywords" button) ──────────────────
+
+/**
+ * Generate target keywords for a (possibly user-supplied) topic. Powers the
+ * manual "Suggest keywords" button: topic-aware when a topic is given,
+ * otherwise falls back to niche/Knowledge-Base keywords. Draws on the
+ * client's Knowledge Base first, then the niche's generic key topics.
+ */
+export async function suggestKeywords(
+  niche: string | null | undefined,
+  topic: string,
+  opts: {
+    knowledge?: { keywords: string[]; topics: string[] };
+    language?: "en" | "fr" | "en_fr";
+  } = {},
+): Promise<string[]> {
+  const ctx = getNicheContext(niche);
+  const cleanTopic = topic.trim();
+
+  const knowledgeSection = buildKnowledgeSection(opts.knowledge);
+  const nicheKeywords =
+    ctx.keyTopics.length > 0
+      ? `\n\nNiche key topics (use as fallback inspiration): ${ctx.keyTopics.join(", ")}`
+      : "";
+
+  const languageClause =
+    opts.language === "fr"
+      ? `\n- Write every keyword in FRENCH (français), Québec phrasing — this is a French-language blog`
+      : "";
+
+  const topicLine = cleanTopic
+    ? `the article topic below`
+    : `the ${ctx.label} niche (no specific topic yet)`;
+
+  const system = `You generate target SEO keywords for a ${ctx.industry} blog (${ctx.label}). Produce 4-6 concrete, search-worthy keywords or short phrases for ${topicLine}. Keywords must:
+- Be specific (real terms of art, products, metrics) — not generic filler
+- Have genuine search intent
+- Prefer terms from the client's Knowledge Base when relevant${languageClause}
+
+Return JSON only:
+{ "keywords": ["kw1", "kw2", "kw3", "kw4"] }`;
+
+  const user = `${cleanTopic ? `Topic: ${cleanTopic}` : "(no topic supplied — suggest niche-level keywords)"}${knowledgeSection}${nicheKeywords}
+
+Suggest the target keywords.`;
+
+  const { text } = await callClaude(system, user, {
+    maxTokens: 200,
+    temperature: 0.7,
+    expectJson: true,
+  });
+
+  try {
+    const parsed = safeParseClaudeJson<{ keywords?: unknown }>(text);
+    if (!Array.isArray(parsed.keywords)) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const k of parsed.keywords) {
+      const s = String(k).trim();
+      if (!s) continue;
+      const key = s.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(s);
+      if (out.length >= 8) break;
+    }
+    return out;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "parse error";
+    throw new Error(
+      `Keyword suggestion returned invalid JSON: ${msg} | response preview: ${text.slice(0, 200)}`,
+    );
+  }
+}
+
+// ─── Analysis (combined SEO/readability/brand voice) ────────────────────────
+
+interface AnalysisOutcome {
+  scores: AnalysisScores;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+async function analyzeContent(
+  content: string,
+  title: string,
+  opts: GenerateOptions,
+): Promise<AnalysisOutcome> {
+  const truncated = content.length > 3000 ? content.substring(0, 3000) + "..." : content;
+  const scores: AnalysisScores = { seoScore: 60, readabilityScore: 65, brandVoiceScore: 65 };
+
+  const system = `You evaluate written content on three dimensions and return numeric scores 1-100.
+
+SEO SCORE (1-100):
+- Primary keyword in title, first paragraph, headings
+- Natural keyword density 1-3%
+- Heading hierarchy and content structure
+- Search intent alignment
+- Title length under 60 chars; meta description 150-160 chars
+
+READABILITY SCORE (1-100):
+- Average sentence length under 20 words
+- Sentence length variety
+- Active voice
+- Clear paragraph structure and transitions
+- Vocabulary appropriate to audience
+
+BRAND VOICE SCORE (1-100):
+- Maintains specified tone throughout
+- Word choice matches brand voice
+- Audience appropriateness
+- Authority level matches positioning
+
+Return ONLY JSON: { "seoScore": number, "readabilityScore": number, "brandVoiceScore": number }`;
+
+  const user = `Evaluate this content.
+
+TITLE: ${title}
+TARGET KEYWORDS: ${opts.keywords.join(", ")}
+SPECIFIED TONE: ${opts.tone}
+BRAND VOICE: ${opts.brandVoice || "(use tone)"}
+TARGET AUDIENCE: ${opts.targetAudience || "general audience"}
+
+CONTENT:
+${truncated}`;
+
+  try {
+    const { text, inputTokens, outputTokens } = await callClaude(system, user, {
+      maxTokens: 200,
+      temperature: 0.1,
+      expectJson: true,
+    });
+    const parsed = safeParseClaudeJson<{
+      seoScore?: number;
+      readabilityScore?: number;
+      brandVoiceScore?: number;
+    }>(text);
+    if (typeof parsed.seoScore === "number") {
+      scores.seoScore = Math.max(1, Math.min(100, Math.round(parsed.seoScore)));
+    }
+    if (typeof parsed.readabilityScore === "number") {
+      scores.readabilityScore = Math.max(1, Math.min(100, Math.round(parsed.readabilityScore)));
+    }
+    if (typeof parsed.brandVoiceScore === "number") {
+      scores.brandVoiceScore = Math.max(1, Math.min(100, Math.round(parsed.brandVoiceScore)));
+    }
+    return { scores, inputTokens, outputTokens };
+  } catch (err) {
+    console.warn("Content analysis failed, using fallback scores:", err);
+    return { scores, inputTokens: 0, outputTokens: 0 };
+  }
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+export async function generateContent(opts: GenerateOptions): Promise<GenerationResult> {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error("ANTHROPIC_API_KEY is not configured.");
+  }
+
+  // Branch on whether the blog has a locked style profile.
+  //   - With profile (peptide blogs): use skeleton-composer + profile-aware scrubber
+  //   - Without profile (other niches): use the existing niche-based prompt +
+  //     scrubber-lite (punctuation + AI-tells, no compliance enforcement)
+  const usingProfile = Boolean(opts.styleProfile);
+
+  // External-link news references — non-peptide blogs only. Pulls
+  // recent items from the news_items cache for the blog's vertical and
+  // formats them as a reference list Claude can inline as <a href>
+  // links. Peptide blogs intentionally skip outbound news links for
+  // compliance posture (we don't want to look like we're endorsing
+  // third-party clinical claims by linking to news articles about
+  // peptides).
+  const nicheNormalized = normalizeNicheKey(opts.niche);
+  const allowExternalNewsLinks =
+    nicheNormalized !== "peptides" && Boolean(opts.verticalKey);
+  let newsLinksClause = "";
+  if (allowExternalNewsLinks) {
+    try {
+      const items = await getRecentNewsForVerticalInternal(
+        opts.verticalKey ?? null,
+        6,
+      );
+      if (items.length > 0) {
+        const refList = items
+          .map((it, i) => {
+            const pub = it.publisher ? ` — ${it.publisher}` : "";
+            return `[${i + 1}] "${it.title}"${pub}\n    ${it.link}`;
+          })
+          .join("\n");
+        newsLinksClause =
+          `\n\nEXTERNAL NEWS REFERENCES (use 1-3 as inline <a href> links where they fit the topic):\n` +
+          `${refList}\n\n` +
+          `LINKING RULES:\n` +
+          `- Pick 1-3 of the above whose headline genuinely relates to a point you're making.\n` +
+          `- Use HTML <a href="URL" target="_blank" rel="${relForBlog(opts.blogSeed)}">descriptive anchor text</a>.\n` +
+          `- Anchor text should describe what the reader is clicking to, NOT raw URLs or "click here".\n` +
+          `- If none of the references fits naturally, do NOT force a link — quality over count.\n` +
+          `- Never include all 6; keep external link count to 3 max.`;
+      }
+    } catch (err) {
+      console.warn(
+        "[content-generator] news-links lookup failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  // Internal-link references — recent sibling posts on the SAME blog.
+  // Pre-fetched by the caller (see content-generation-actions.ts). Claude
+  // weaves 2–4 of them in as inline <a href> anchors. Per the footprint
+  // audit, internal link architecture is the single biggest SEO signal
+  // we were leaving on the table; sibling links also raise time-on-site,
+  // which is an actual ranking input.
+  let internalLinksClause = "";
+  const refs = opts.internalLinkRefs ?? [];
+  if (refs.length > 0) {
+    const refList = refs
+      .slice(0, 8)
+      .map((it, i) => `[${i + 1}] "${it.title}"\n    ${it.url}`)
+      .join("\n");
+    internalLinksClause =
+      `\n\nINTERNAL LINKS — recent posts on THIS site (weave 2–4 in as inline anchors):\n` +
+      `${refList}\n\n` +
+      `INTERNAL LINKING RULES:\n` +
+      `- Pick 2–4 of the above whose topic genuinely relates to what this article is about.\n` +
+      `- Use HTML <a href="URL">descriptive anchor text</a> — no target/rel attributes (these are same-site).\n` +
+      `- Anchor text must describe the linked article's subject, never "click here" / "this post" / raw URLs.\n` +
+      `- Place internal links inside sentences where the reader would actually click for more — not in a "related posts" footer.\n` +
+      `- Do NOT exceed 4 internal links.`;
+  }
+
+  // Language directive — appended to the system prompt so French
+  // verticals (gym, roofing, tax lawyer, pest) generate French content
+  // and the title / excerpt / meta fields come back in French too.
+  const languageDirective = buildLanguageDirective(opts.language);
+
+  // Client Knowledge Base context — appended to the SYSTEM prompt (the stable
+  // per-blog prefix) so the article draws on the client's own material.
+  const knowledgeContext = buildKnowledgeContext(opts.knowledgeSummaries);
+
+  let system: string;
+  let user: string;
+  let maxTokens: number;
+  if (usingProfile && opts.styleProfile) {
+    const composed = composeForPost({
+      profile: opts.styleProfile,
+      topic: opts.topic,
+      // For universal-niche profiles, pass the blog's actual niche label
+      // (e.g. "gym marketing") so the prompt's {sub_niche} placeholder
+      // gets a topical value instead of the generic "General Content".
+      nicheLabel: opts.niche,
+    });
+    system = composed.systemPrompt + languageDirective + knowledgeContext + SEO_QUALITY_DIRECTIVE;
+    user = composed.userPrompt;
+    // Append the external-news-links clause (no-op for peptides — they
+    // skip this entirely upstream).
+    if (newsLinksClause) {
+      user = user + newsLinksClause;
+    }
+    if (internalLinksClause) {
+      user = user + internalLinksClause;
+    }
+    // Profile blogs may target word bands up to 3000 words. Schema C (FAQ-
+    // rich) and Schema D (listicle) include extra structured arrays beyond
+    // the main content, so we budget generously: ~3.0 tokens/word covers
+    // prose + JSON envelope + nested arrays + HTML tags + extra safety
+    // margin against unicode-heavy content (peptide compound names, citations
+    // with accents, etc. all cost more tokens per char). Cap at 8192 —
+    // Sonnet 4.5's max output. The strict word-count directive in the
+    // system prompt now also tells Claude to stay under the ceiling rather
+    // than hit it exactly, which together with the bigger budget eliminates
+    // mid-string truncation for almost all posts.
+    maxTokens = Math.min(8192, Math.round(opts.styleProfile.wordBandMax * 3.0));
+  } else {
+    system = buildSystemPrompt(opts) + languageDirective + knowledgeContext + SEO_QUALITY_DIRECTIVE;
+    user = buildUserPrompt(opts);
+    if (newsLinksClause) {
+      user = user + newsLinksClause;
+    }
+    if (internalLinksClause) {
+      user = user + internalLinksClause;
+    }
+    maxTokens = 4000;
+  }
+
+    // 1. Generate — with ONE shape-retry on missing content. First attempt
+  //    uses the full styled prompt; the retry swaps in a minimal
+  //    consumer-information prompt because the full styled prompt is
+  //    exactly what tends to trigger the {title}-only refusal pattern.
+  //    The retry sacrifices per-blog voice continuity to actually get the
+  //    article body back.
+  let parsed: Partial<GeneratedContent> = {};
+  let genInput = 0;
+  let genOutput = 0;
+  let lastShapeKeys = "(empty)";
+  let lastShapePreview = "";
+
+  for (let shapeAttempt = 0; shapeAttempt <= MAX_SHAPE_RETRIES; shapeAttempt++) {
+    const attemptSystem =
+      shapeAttempt === 0
+        ? system
+        : `You are writing a consumer-information article for an adult audience. The topic and target language come from the user message below. Treat the topic analytically and informatively. Write the full article naturally — multiple sections with <h2> headings, paragraphs, lists where useful.
+
+Return ONE JSON object with these fields:
+{
+  "title": "...",
+  "content": "<p>opening paragraph...</p><h2>section heading</h2><p>...</p><h2>next section</h2><p>...</p>",
+  "excerpt": "150-160 character summary",
+  "metaTitle": "SEO title under 60 chars",
+  "metaDescription": "150-160 char meta description",
+  "keywords": ["...", "...", "..."]
+}
+
+The "content" field is the full HTML article body — at least ${MIN_WORDS} words. Use <p>, <h2>, <h3>, <ul>, <ol>, <li>, <strong>, <em>, <a> tags only. Escape \\" inside HTML attribute values.${languageDirective}`;
+
+    const attemptUser =
+      shapeAttempt === 0 ? user : user + SHAPE_RETRY_REMINDER;
+
+    if (shapeAttempt > 0) {
+      console.info(
+        `[content-generator] retry attempt ${shapeAttempt + 1} using simplified fallback prompt`,
+      );
+    }
+
+    const gen = await callClaude(attemptSystem, attemptUser, {
+      maxTokens,
+      // 0.5 (down from 0.7). Lower variance reduces the chance the
+      // sampler picks a hedging trajectory that returns {title} only.
+      temperature: 0.5,
+      expectJson: true,
+    });
+    genInput += gen.inputTokens;
+    genOutput += gen.outputTokens;
+
+    // 2. Parse — safeParseClaudeJson tries direct then repaired.
+    let candidate: Partial<GeneratedContent>;
+    try {
+      candidate = safeParseClaudeJson<Partial<GeneratedContent>>(gen.text);
+    } catch (err) {
+      if (shapeAttempt < MAX_SHAPE_RETRIES) {
+        console.warn(
+          `[content-generator] attempt ${shapeAttempt + 1} produced invalid JSON — retrying`,
+        );
+        continue;
+      }
+      const msg = err instanceof Error ? err.message : "parse error";
+      throw new Error(`Claude returned invalid JSON: ${msg}`);
+    }
+
+    parsed = normalizeArticleShape(candidate);
+
+    if (parsed.title && parsed.content) {
+      if (shapeAttempt > 0) {
+        console.info(
+          `[content-generator] shape recovered on attempt ${shapeAttempt + 1}`,
+        );
+      }
+      break;
+    }
+
+    lastShapeKeys = Object.keys(parsed).join(", ") || "(empty)";
+    lastShapePreview = Object.entries(parsed)
+      .slice(0, 8)
+      .map(([k, v]) => {
+        if (typeof v === "string") return `${k}=str(${v.length}ch)`;
+        if (Array.isArray(v)) return `${k}=arr(${v.length})`;
+        if (v && typeof v === "object") return `${k}=obj{${Object.keys(v).slice(0, 4).join(",")}}`;
+        return `${k}=${typeof v}`;
+      })
+      .join(" ");
+
+    if (shapeAttempt < MAX_SHAPE_RETRIES) {
+      console.warn(
+        `[content-generator] attempt ${shapeAttempt + 1} missing content (keys: ${lastShapeKeys}) — retrying with stripped prompt`,
+      );
+    }
+  }
+
+  if (!parsed.title || !parsed.content) {
+    throw new Error(
+      `Claude response missing required fields (title, content) after ${MAX_SHAPE_RETRIES + 1} attempts. ` +
+        `Returned keys: ${lastShapeKeys}. Shape: ${lastShapePreview}. ` +
+        `Reconstruction did not match any known variant — extend ` +
+        `reconstructContentFromParts() in content-generator.ts.`,
+    );
+  }
+  // 3. Format + sanitize, strip any Claude-emitted images (they'd be broken).
+  //    Word-count enforcement here is the legacy hard MIN_WORDS check; for
+  //    profile blogs the scrubber's Layer 1F handles word-band checks.
+  let body = parsed.content;
+  if (body.includes("#")) body = convertMarkdownToHtml(body);
+  body = sanitizeMetadata(body);
+  body = stripClaudeImages(body);
+  // Guarantee the body carries no <h1> — the platform title is the page's
+  // sole H1. Prevents the "Too many H1 headings" SEO error.
+  body = demoteH1ToH2(body);
+  // Drop duplicate heading text (and any body heading that restates the
+  // title) — clears the "duplicate heading texts" audit warning.
+  body = dedupeHeadings(body, parsed.title ?? "");
+
+  if (!usingProfile) {
+    body = capWordCount(body, MAX_WORDS);
+    const wordCount = countWordsInHtml(body);
+    if (wordCount < MIN_WORDS) {
+      throw new Error(
+        `Generated content is ${wordCount} words, below the ${MIN_WORDS}-word minimum`,
+      );
+    }
+  }
+
+  // 4. Scrubber — profile-aware when a profile exists, lite otherwise.
+  let scrubberReport: ScrubberReport | undefined;
+  let flaggedForReview = false;
+  if (usingProfile && opts.styleProfile) {
+    const result = runScrubber({
+      content: body,
+      profile: opts.styleProfile,
+    });
+    body = result.content;
+    scrubberReport = result.report;
+    flaggedForReview = result.flaggedForReview;
+  } else {
+    // Lite path — auto-fix punctuation + log AI-tell hits but don't gate.
+    const lite = runScrubberLite(body);
+    body = lite.content;
+  }
+
+  const wordCount = countWordsInHtml(body);
+
+  // 5. Compute the hero image URL via Google Nano Banana.
+  //    Strategy: run a small Claude call to summarize the article body into
+  //    a concrete photographic scene description, then pass that to Nano
+  //    Banana as a customScene. This makes the image content-aware (the
+  //    scene actually matches what THIS article is about) instead of
+  //    falling back to the blog's locked sub-niche theme for every post.
+  //    Falls back to the static scene builder if the summary call fails.
+  //    Output is always a data: URI — Shopify and WordPress decode it
+  //    inline at publish time. No fallback provider.
+  const imageKeywords =
+    parsed.keywords && parsed.keywords.length > 0 ? parsed.keywords : opts.keywords;
+  let heroImageUrl: string | undefined;
+  let bodyImageUrl: string | undefined;
+  let customScene: string | null = null;
+  try {
+    customScene = await summarizeArticleAsScene(
+      parsed.title,
+      body,
+      imageKeywords,
+    );
+    if (customScene) {
+      console.info(
+        `[content-generator] Image scene: "${customScene.slice(0, 100)}${customScene.length > 100 ? "…" : ""}"`,
+      );
+    }
+
+    const imageInputBase = {
+      title: parsed.title,
+      keywords: imageKeywords,
+      niche: opts.niche,
+      subNicheId: opts.styleProfile?.subNicheId,
+      primaryCompounds: opts.styleProfile?.primaryCompounds,
+      customScene: customScene ?? undefined,
+    };
+
+    // Generate hero + body in parallel — they share the same scene but
+    // request different framings (wide vs detail), giving the post two
+    // visually distinct images for ~2× the latency of one.
+    // Either failure is non-fatal: settle so a body-image timeout
+    // doesn't drop the hero.
+    const [heroResult, bodyResult] = await Promise.allSettled([
+      generateHeroImage(imageInputBase),
+      generateBodyImage(imageInputBase),
+    ]);
+
+    if (heroResult.status === "fulfilled") {
+      heroImageUrl = heroResult.value.url;
+      console.info(
+        `[content-generator] Hero image via ${heroResult.value.model} for "${parsed.title.slice(0, 60)}"`,
+      );
+    } else {
+      console.error(
+        "[content-generator] Hero image generation failed:",
+        heroResult.reason,
+      );
+    }
+
+    if (bodyResult.status === "fulfilled") {
+      bodyImageUrl = bodyResult.value.url;
+      console.info(
+        `[content-generator] Body image via ${bodyResult.value.model} for "${parsed.title.slice(0, 60)}"`,
+      );
+    } else {
+      console.error(
+        "[content-generator] Body image generation failed:",
+        bodyResult.reason,
+      );
+    }
+
+    // HERO RETRY — the hero is the post's primary image; never ship
+    // without one if we can avoid it. If the first attempt failed
+    // (transient Google error, or a customScene the safety filter
+    // rejected), retry ONCE using the static niche scene instead of
+    // the article-derived customScene. The static scenes are
+    // pre-vetted and safe-filter-friendly, so this recovers the vast
+    // majority of first-attempt failures.
+    if (!heroImageUrl) {
+      try {
+        const retry = await generateHeroImage({
+          title: parsed.title,
+          keywords: imageKeywords,
+          niche: opts.niche,
+          subNicheId: opts.styleProfile?.subNicheId,
+          primaryCompounds: opts.styleProfile?.primaryCompounds,
+          // No customScene → buildImagePrompt uses the static niche
+          // scene (SUB_NICHE_VISUALS / FREE_NICHE_VISUALS / default).
+        });
+        heroImageUrl = retry.url;
+        console.info(
+          `[content-generator] Hero image RECOVERED on retry (static scene) for "${parsed.title.slice(0, 60)}"`,
+        );
+      } catch (retryErr) {
+        console.error(
+          "[content-generator] Hero image retry also failed:",
+          retryErr,
+        );
+      }
+    }
+
+    // BODY RETRY — same idea, lower priority. Only retry if the hero
+    // succeeded (so we don't double-spend Google calls on a fully-down
+    // API). Static scene, body framing.
+    if (!bodyImageUrl && heroImageUrl) {
+      try {
+        const retry = await generateBodyImage({
+          title: parsed.title,
+          keywords: imageKeywords,
+          niche: opts.niche,
+          subNicheId: opts.styleProfile?.subNicheId,
+          primaryCompounds: opts.styleProfile?.primaryCompounds,
+        });
+        bodyImageUrl = retry.url;
+        console.info(
+          `[content-generator] Body image RECOVERED on retry (static scene) for "${parsed.title.slice(0, 60)}"`,
+        );
+      } catch {
+        // Non-fatal — body image is optional.
+      }
+    }
+  } catch (err) {
+    // Scene summarizer threw — log and ship without images rather than
+    // substituting an unrelated placeholder.
+    console.error("[content-generator] Image pipeline failed:", err);
+  }
+
+  // Embed the body image into the HTML at roughly the midpoint so it
+  // actually appears in the published post. Hero stays as the featured
+  // image (rendered above the post by Shopify/WordPress themes).
+  if (bodyImageUrl) {
+    body = embedBodyImage(body, bodyImageUrl, parsed.title, opts.blogSeed);
+  }
+
+  // Inject the client's call-to-action button at its configured position(s)
+  // — no-op when the client has no CTA configured.
+  body = injectCta(body, opts.cta, opts.blogSeed);
+
+  // 6. Scoring removed (per footprint audit insight 2). The old
+  //    analyzeContent call cost ~$0.0015/post AND optimized to exactly the
+  //    metrics classifiers fingerprint (keyword density 1-3%, primary kw
+  //    in first 100w). Replacement is a local uniqueness + fingerprint
+  //    check — separate follow-up. Default scores keep the DB schema and
+  //    UI happy; they're advisory anyway, never blocking.
+  const scores: AnalysisScores = {
+    seoScore: 70,
+    readabilityScore: 70,
+    brandVoiceScore: 70,
+  };
+
+  const totalInputTokens = genInput;
+  const totalOutputTokens = genOutput;
+  const totalTokens = totalInputTokens + totalOutputTokens;
+  const costUsd = calcCost(totalInputTokens, totalOutputTokens);
+
+  return {
+    title: parsed.title,
+    content: body,
+    excerpt: parsed.excerpt || generateExcerpt(body),
+    metaTitle: normalizeMetaTitle(parsed.metaTitle, parsed.title),
+    metaDescription: normalizeMetaDescription(
+      parsed.metaDescription,
+      generateExcerpt(body),
+    ),
+    keywords: parsed.keywords && parsed.keywords.length > 0 ? parsed.keywords : opts.keywords,
+    wordCount,
+    seoScore: scores.seoScore,
+    readabilityScore: scores.readabilityScore,
+    brandVoiceScore: scores.brandVoiceScore,
+    tokensUsed: totalTokens,
+    costUsd: Number(costUsd.toFixed(6)),
+    heroImageUrl,
+    bodyImageUrl,
+    scrubberReport,
+    flaggedForReview,
+  };
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Insert the body image into the article HTML at roughly the midpoint.
+ *
+ * Strategy: split the body on closing </p> tags, walk to the paragraph
+ * that crosses the halfway word-count mark, and insert a <figure> with
+ * the image right before it. If the body has fewer than 4 paragraphs
+ * we fall back to inserting before the last paragraph so the image
+ * doesn't end up at the very top or in a one-line stub.
+ *
+ * Uses a plain alt attribute derived from the post title — the body
+ * image content is conceptually the same topic as the hero, so we
+ * don't bother generating a separate alt string.
+ */
+function embedBodyImage(
+  html: string,
+  dataUri: string,
+  title: string,
+  blogSeed?: string,
+): string {
+  const safeAlt = title
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .slice(0, 200);
+  // Per-blog wrapper class + style variant so this markup isn't identical
+  // across the network (footprint audit #8). Same blog → same markup always.
+  const cls = bodyImageClassForBlog(blogSeed);
+  // Two style variants picked deterministically so different blogs emit
+  // different inline-style strings. Both render identically; only the
+  // serialized HTML differs.
+  const styleVariant = blogSeed && hashSeed(blogSeed) % 2 === 0
+    ? `margin:1.5em 0;`
+    : `margin:1.25rem 0 1.75rem;`;
+  const imgStyle = blogSeed && (hashSeed(blogSeed) >> 3) % 2 === 0
+    ? `width:100%;height:auto;display:block;`
+    : `display:block;max-width:100%;height:auto;`;
+  const figure =
+    `<figure class="${cls}" style="${styleVariant}">` +
+    `<img src="${dataUri}" alt="${safeAlt}" loading="lazy" ` +
+    `style="${imgStyle}" />` +
+    `</figure>`;
+
+  // Split keeping the closing tag attached to each piece.
+  const parts = html.split(/(<\/p>)/i);
+  // After the split, paragraphs look like [text, "</p>", text, "</p>", ...].
+  // Rebuild paragraphs by pairing each text part with its closing tag.
+  type Para = { html: string; words: number };
+  const paragraphs: Para[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const text = parts[i] ?? "";
+    const close = parts[i + 1] ?? "";
+    const combined = text + close;
+    if (combined.trim().length === 0) continue;
+    const words = combined.replace(/<[^>]+>/g, " ").trim().split(/\s+/).length;
+    paragraphs.push({ html: combined, words });
+  }
+
+  if (paragraphs.length === 0) {
+    // No paragraphs — append at end as fallback.
+    return html + figure;
+  }
+  if (paragraphs.length < 4) {
+    // Short article — insert before the last paragraph.
+    const insertAt = paragraphs.length - 1;
+    return (
+      paragraphs
+        .slice(0, insertAt)
+        .map((p) => p.html)
+        .join("") +
+      figure +
+      paragraphs
+        .slice(insertAt)
+        .map((p) => p.html)
+        .join("")
+    );
+  }
+
+  // Walk paragraphs accumulating word count until we cross the midpoint.
+  const total = paragraphs.reduce((s, p) => s + p.words, 0);
+  const midpoint = total / 2;
+  let running = 0;
+  let insertBefore = Math.floor(paragraphs.length / 2); // safe default
+  for (let i = 0; i < paragraphs.length; i++) {
+    running += paragraphs[i].words;
+    if (running >= midpoint) {
+      // Insert before paragraph i so the image breaks the flow at the
+      // halfway mark rather than after it.
+      insertBefore = i;
+      break;
+    }
+  }
+  // Never insert before paragraph 0 or after the last — both look bad.
+  if (insertBefore <= 0) insertBefore = 1;
+  if (insertBefore >= paragraphs.length) insertBefore = paragraphs.length - 1;
+
+  return (
+    paragraphs
+      .slice(0, insertBefore)
+      .map((p) => p.html)
+      .join("") +
+    figure +
+    paragraphs
+      .slice(insertBefore)
+      .map((p) => p.html)
+      .join("")
+  );
+}
